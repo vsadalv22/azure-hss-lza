@@ -1,0 +1,256 @@
+# ============================================================
+# Pipeline: 03 - Platform: Connectivity
+# Deploys the Hub VNet (10.0.0.0/16), ExpressRoute Gateway
+# (zone-redundant ErGw1AZ), and Checkpoint CloudGuard NVA
+# into the Connectivity subscription.
+#
+# What is NOT automated — manual steps required after this pipeline:
+#   1. Create the ER circuit in Azure Portal / CLI
+#   2. Send the service key to your provider (Equinix / Megaport)
+#   3. Wait for provider to set circuit status to Provisioned
+#   4. Run pipeline 03b to link the gateway to the circuit
+#
+# See: docs/expressroute-setup.md for the full manual runbook
+#
+# Trigger: changes to platform/connectivity/** (except er-connection.bicep)
+# Manual:  Run pipeline button in ADO with optional parameter overrides
+#
+# Deployment order: 01 → 02-logging → THIS → 03b-er-connection
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - platform/connectivity/**
+    exclude:
+      - platform/connectivity/modules/er-connection.bicep   # 03b handles this
+
+pr: none   # PRs to non-main branches must NOT trigger production pipelines
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: checkpointSku
+    displayName: 'Checkpoint licence SKU'
+    type: string
+    default: 'sg-byol'
+    values:
+      - sg-byol
+      - sg-ngtp
+      - sg-ngtx
+
+  - name: erGatewaySku
+    displayName: 'ExpressRoute Gateway SKU'
+    type: string
+    default: 'ErGw1AZ'
+    values:
+      - ErGw1AZ
+      - ErGw2AZ
+      - ErGw3AZ
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID, CONNECTIVITY_SUBSCRIPTION_ID,
+                                    # CHECKPOINT_ADMIN_PASSWORD, LOG_ANALYTICS_WORKSPACE_ID
+  - group: alz-platform-variables   # Non-secret config values
+
+# ============================================================
+# STAGE 1 — LINT (automated)
+# ============================================================
+stages:
+  - stage: Lint
+    displayName: 'Stage 1 — Bicep Lint'
+    jobs:
+      - job: BicepLint
+        displayName: 'Bicep Lint — Connectivity'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint connectivity Bicep templates'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Linting main connectivity template..."
+                az bicep build --file platform/connectivity/main.bicep
+
+                echo "Linting Checkpoint NVA module..."
+                az bicep build --file platform/connectivity/modules/checkpoint-nva.bicep
+
+                echo "All lint checks passed."
+
+  # ============================================================
+  # STAGE 2 — WHAT-IF (automated, depends on Lint)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 2 — What-If (Dry Run)'
+    dependsOn: Lint
+    condition: succeeded('Lint')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — Hub VNet + ER Gateway + Checkpoint NVA'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'What-If — Connectivity Stack'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOY_NAME="alz-connectivity-whatif-$(date +%Y%m%d%H%M%S)"
+                echo "Running what-if: $DEPLOY_NAME"
+                echo "Target subscription: $(CONNECTIVITY_SUBSCRIPTION_ID)"
+                echo "Checkpoint SKU: ${{ parameters.checkpointSku }}"
+                echo "ER Gateway SKU: ${{ parameters.erGatewaySku }}"
+
+                az deployment sub what-if \
+                  --name "$DEPLOY_NAME" \
+                  --location australiaeast \
+                  --subscription "$(CONNECTIVITY_SUBSCRIPTION_ID)" \
+                  --template-file platform/connectivity/main.bicep \
+                  --parameters platform/connectivity/parameters/hub-networking.bicepparam \
+                  --parameters \
+                    logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                    checkpointAdminPassword="$(CHECKPOINT_ADMIN_PASSWORD)" \
+                    checkpointSku="${{ parameters.checkpointSku }}" \
+                    erGatewaySku="${{ parameters.erGatewaySku }}" \
+                  2>&1 | tee whatif-output.txt
+
+                echo ""
+                echo "What-if complete. Review changes above before approving deployment."
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If output'
+            condition: always()
+            inputs:
+              targetPath: whatif-output.txt
+              artifactName: 'whatif-connectivity-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 3 — DEPLOY (requires platform-production environment approval)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 3 — Deploy Connectivity Stack'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: DeployConnectivity
+        displayName: 'Deploy — Hub VNet + ER Gateway + Checkpoint NVA'
+        environment: platform-production    # Platform team must approve in ADO Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Connectivity Stack (subscription scope)'
+                  name: DeployStep
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      DEPLOY_NAME="alz-connectivity-$(date +%Y%m%d%H%M%S)"
+                      echo "Deployment name: $DEPLOY_NAME"
+                      echo "Target subscription: $(CONNECTIVITY_SUBSCRIPTION_ID)"
+                      echo "Checkpoint SKU: ${{ parameters.checkpointSku }}"
+                      echo "ER Gateway SKU: ${{ parameters.erGatewaySku }}"
+
+                      OUTPUT=$(az deployment sub create \
+                        --name "$DEPLOY_NAME" \
+                        --location australiaeast \
+                        --subscription "$(CONNECTIVITY_SUBSCRIPTION_ID)" \
+                        --template-file platform/connectivity/main.bicep \
+                        --parameters platform/connectivity/parameters/hub-networking.bicepparam \
+                        --parameters \
+                          logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                          checkpointAdminPassword="$(CHECKPOINT_ADMIN_PASSWORD)" \
+                          checkpointSku="${{ parameters.checkpointSku }}" \
+                          erGatewaySku="${{ parameters.erGatewaySku }}" \
+                        --output json)
+
+                      echo "$OUTPUT" | tee connectivity-output.json
+
+                      # Extract outputs
+                      HUB_VNET_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.hubVnetId.value    // empty')
+                      RT_ID=$(echo "$OUTPUT"        | jq -r '.properties.outputs.routeTableId.value // empty')
+                      ERGW_ID=$(echo "$OUTPUT"      | jq -r '.properties.outputs.erGatewayId.value  // empty')
+
+                      echo "##[section]Deployment outputs:"
+                      echo "  Hub VNet ID    : $HUB_VNET_ID"
+                      echo "  Route Table ID : $RT_ID"
+                      echo "  ER Gateway ID  : $ERGW_ID"
+
+                      # Surface as pipeline output variables for reference
+                      echo "##vso[task.setvariable variable=hubVnetId;isOutput=true]$HUB_VNET_ID"
+                      echo "##vso[task.setvariable variable=routeTableId;isOutput=true]$RT_ID"
+                      echo "##vso[task.setvariable variable=erGatewayId;isOutput=true]$ERGW_ID"
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish deployment output'
+                  condition: always()
+                  inputs:
+                    targetPath: connectivity-output.json
+                    artifactName: 'connectivity-output-$(Build.BuildNumber)'
+
+                - bash: |
+                    set -euo pipefail
+
+                    HUB_ID=$(cat connectivity-output.json  | jq -r '.properties.outputs.hubVnetId.value    // "N/A"')
+                    ERGW_ID=$(cat connectivity-output.json | jq -r '.properties.outputs.erGatewayId.value  // "N/A"')
+                    RT_ID=$(cat connectivity-output.json   | jq -r '.properties.outputs.routeTableId.value // "N/A"')
+
+                    cat << SUMMARY
+                    ============================================================
+                    Connectivity Stack Deployed Successfully
+                    ============================================================
+                    Hub VNet ID    : $HUB_ID
+                    ER Gateway ID  : $ERGW_ID
+                    Route Table ID : $RT_ID
+                    ============================================================
+
+                    ACTION REQUIRED — Manual steps before running pipeline 03b:
+                    ============================================================
+
+                    Step 1: Update the 'alz-platform-secrets' variable group in ADO Library:
+                      ER_GATEWAY_ID  = $ERGW_ID
+
+                    Step 2: Create the ExpressRoute Circuit (Manual — NOT managed by IaC)
+                      a) Open Azure Portal > ExpressRoute circuits > + Create
+                      b) Fill in circuit details per docs/expressroute-setup.md
+                      c) Copy the Service Key from the circuit Overview page
+                      d) Send the service key to your provider (Equinix / Megaport / Telstra)
+                      e) Wait for provider to set circuit status to Provisioned (1-5 business days)
+
+                    Step 3: Once circuit is Provisioned, run pipeline 03b-er-connection
+                      Provide the circuit resource ID as the pipeline parameter.
+
+                    Step 4: Checkpoint NVA First Time Configuration
+                      Connect via on-premises jump host over ER and complete the
+                      First Time Configuration wizard.
+                      See README.md for Checkpoint CloudGuard NVA setup details.
+                    ============================================================
+                    SUMMARY
+                  displayName: 'Post-deploy summary and manual next steps'

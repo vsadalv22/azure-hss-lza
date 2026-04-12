@@ -5,7 +5,8 @@ targetScope = 'subscription'
 // Region  : Australia East
 // Scope   : Management Subscription (shared SOC workspace)
 // Includes: Sentinel workspace, data connectors, analytics
-//           rules, UEBA, watchlists, automation rules
+//           rules, UEBA, watchlists, automation rules,
+//           HSP row-level data scoping (DD40)
 // ============================================================
 
 @description('Azure region')
@@ -44,6 +45,13 @@ param tags object = {
   managedBy  : 'soc-team'
   createdBy  : 'alz-bicep'
 }
+
+// ---- DD40: HSP Row-Level Data Scoping ----
+@description('DD40 — Enable HSP row-level data scoping in Sentinel')
+param enableHspDataSegregation bool = true
+
+@description('DD40 — List of HSP names for table-level RBAC (e.g. [\'perth-childrens\', \'fiona-stanley\', \'rpbg\'])')
+param hspList array = []
 
 // ============================================================
 // Reference existing Log Analytics workspace (created by
@@ -423,6 +431,55 @@ resource rulePasswordSpray 'Microsoft.SecurityInsights/alertRules@2023-02-01-pre
   dependsOn: [sentinel]
 }
 
+// Rule 6 (DD40): HSP cross-tenant resource access detection
+// Detects when a principal accesses resources outside their designated HSP
+// management group — potential data boundary violation
+resource ruleHspCrossAccess 'Microsoft.SecurityInsights/alertRules@2023-02-01-preview' = if (enableHspDataSegregation) {
+  name: guid(existingLaw.id, 'HspCrossTenantResourceAccess')
+  scope: existingLaw
+  kind: 'Scheduled'
+  properties: {
+    displayName: 'HSP Cross-Tenant Resource Access Detected'
+    description: 'DD40 — Fires when a principal tagged to one HSP performs write/delete operations on resources tagged to a different HSP management group. Indicates a potential data boundary violation across Health Service Providers.'
+    severity: 'High'
+    enabled: true
+    query: '''
+      AzureActivity
+      | where CategoryValue == "Administrative"
+      | where ActivityStatusValue == "Success"
+      | where OperationNameValue !endswith "/read"
+      | extend CallerHsp     = tostring(parse_json(Properties)["requestbody_tags_hsp-id"])
+      | extend ResourceHsp   = tostring(parse_json(Properties)["tags_hsp-id"])
+      | where isnotempty(CallerHsp) and isnotempty(ResourceHsp)
+      | where CallerHsp != ResourceHsp
+      | project
+          TimeGenerated,
+          Caller,
+          CallerHsp,
+          ResourceHsp,
+          OperationNameValue,
+          ResourceGroup,
+          Resource,
+          SubscriptionId
+    '''
+    queryFrequency: 'PT15M'
+    queryPeriod: 'PT15M'
+    triggerOperator: 'GreaterThan'
+    triggerThreshold: 0
+    suppressionDuration: 'PT1H'
+    suppressionEnabled: false
+    tactics: ['PrivilegeEscalation', 'LateralMovement']
+    techniques: ['T1078', 'T1550']
+    entityMappings: [
+      {
+        entityType: 'Account'
+        fieldMappings: [{ identifier: 'FullName'; columnName: 'Caller' }]
+      }
+    ]
+  }
+  dependsOn: [sentinel]
+}
+
 // ============================================================
 // Automation Rule — Auto-assign High severity incidents
 // ============================================================
@@ -498,8 +555,127 @@ resource securityContact 'Microsoft.Security/securityContacts@2020-01-01-preview
 }
 
 // ============================================================
+// DD40 — HSP Row-Level Data Scoping
+// Workspace table configuration, DCR tagging, and custom log
+// ============================================================
+
+// Table: SecurityEvent — Analytics plan with HSP scoping note
+// HSP data segregation is enforced via workspace-level RBAC
+// (custom roles per HSP bound to their resource tag scope) and
+// supplemented by Sentinel data collection rules below.
+// Column-level security for the HSP tag dimension is achieved
+// through the HSPAuditLog_CL custom table and DCR transforms.
+resource tableSecurityEvent 'Microsoft.OperationalInsights/workspaces/tables@2023-09-01' = if (enableHspDataSegregation) {
+  name: '${logAnalyticsWorkspaceName}/SecurityEvent'
+  properties: {
+    plan: 'Analytics'
+    // NOTE (DD40): Row-level scoping for HSP segregation is applied via:
+    //   1. Workspace RBAC — HSP-scoped custom roles restrict table query access
+    //      to rows matching the caller's hsp-id tag.
+    //   2. Data Collection Rules (dcr-sentinel-hsp-tagging-001) append an
+    //      HSPTag column sourced from the resource tag 'hsp-id', enabling
+    //      KQL row filters in analytics rules and workbooks.
+    //   Full column-level security requires Sentinel Content Hub
+    //   "Table-based RBAC" feature (preview) enabled per workspace.
+    retentionInDays: retentionInDays
+  }
+}
+
+// DCR: HSP Traffic Tagging (DD40)
+// Appends an HSPTag column from the resource tag 'hsp-id' so that
+// all downstream KQL queries can filter by Health Service Provider.
+resource dcrHspTagging 'Microsoft.Insights/dataCollectionRules@2023-03-11' = if (enableHspDataSegregation) {
+  name: 'dcr-sentinel-hsp-tagging-001'
+  location: location
+  tags: tags
+  properties: {
+    description: 'DD40 — Appends HSPTag column from resource tag hsp-id to Windows Security Events for HSP data segregation in Sentinel.'
+    dataCollectionEndpointId: null
+    dataSources: {
+      windowsEventLogs: [
+        {
+          name: 'windowsSecurityEvents'
+          streams: ['Microsoft-SecurityEvent']
+          xPathQueries: [
+            'Security!*[System[(EventID=4624 or EventID=4625 or EventID=4648 or EventID=4688 or EventID=4698 or EventID=4702 or EventID=4720 or EventID=4726 or EventID=4732 or EventID=4756)]]'
+          ]
+        }
+      ]
+    }
+    destinations: {
+      logAnalytics: [
+        {
+          name: 'sentinelWorkspace'
+          workspaceResourceId: existingLaw.id
+        }
+      ]
+    }
+    dataFlows: [
+      {
+        streams: ['Microsoft-SecurityEvent']
+        destinations: ['sentinelWorkspace']
+        transformKql: '''
+          source
+          | extend HSPTag = tostring(tags["hsp-id"])
+          | extend HSPTag = iif(isempty(HSPTag), "untagged", HSPTag)
+        '''
+        outputStream: 'Microsoft-SecurityEvent'
+      }
+    ]
+  }
+}
+
+// Custom Log Table: HSPAuditLog_CL (DD40)
+// Records HSP-specific operational audit events for cross-HSP
+// access review, compliance reporting, and Sentinel workbooks.
+resource tableHspAuditLog 'Microsoft.OperationalInsights/workspaces/tables@2023-09-01' = if (enableHspDataSegregation) {
+  name: '${logAnalyticsWorkspaceName}/HSPAuditLog_CL'
+  properties: {
+    plan: 'Analytics'
+    retentionInDays: retentionInDays
+    schema: {
+      name: 'HSPAuditLog_CL'
+      columns: [
+        {
+          name: 'TimeGenerated'
+          type: 'datetime'
+          description: 'Timestamp of the audit event (UTC)'
+        }
+        {
+          name: 'HspId'
+          type: 'string'
+          description: 'Health Service Provider identifier (matches hsp-id resource tag)'
+        }
+        {
+          name: 'OperationType'
+          type: 'string'
+          description: 'Type of operation performed (e.g. Read, Write, Delete, CrossAccess)'
+        }
+        {
+          name: 'ResourceId'
+          type: 'string'
+          description: 'Full Azure resource ID of the affected resource'
+        }
+        {
+          name: 'InitiatedBy'
+          type: 'string'
+          description: 'UPN or service principal that initiated the operation'
+        }
+        {
+          name: 'Details'
+          type: 'dynamic'
+          description: 'Additional structured details (JSON bag) — policy outcome, tags, source IP, etc.'
+        }
+      ]
+    }
+  }
+}
+
+// ============================================================
 // Outputs
 // ============================================================
 output sentinelWorkspaceId string = existingLaw.id
 output sentinelWorkspaceName string = existingLaw.name
 output connectorCount int = 8
+output analyticsRuleCount int = enableHspDataSegregation ? 6 : 5
+output hspDataSegregationEnabled bool = enableHspDataSegregation

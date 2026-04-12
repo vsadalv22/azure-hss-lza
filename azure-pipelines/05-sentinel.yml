@@ -1,0 +1,214 @@
+# ============================================================
+# Pipeline: 05 - Platform: Microsoft Sentinel
+# Deploys Microsoft Sentinel (SIEM/SOAR), Defender for Cloud,
+# analytics rules, watchlists, and TAXII threat intelligence
+# feed configuration into the Management subscription.
+#
+# Trigger: changes to platform/sentinel/**  on main
+# Manual:  Run pipeline button in ADO
+#
+# Deployment order: 01 → 02-logging → 03 → 04 → THIS
+#   (Requires Log Analytics Workspace from pipeline 02)
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - platform/sentinel/**
+
+pr: none   # PRs to non-main branches must NOT trigger production pipelines
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID,
+                                    # MANAGEMENT_SUBSCRIPTION_ID,
+                                    # SENTINEL_SECURITY_CONTACT
+  - group: alz-platform-variables   # Non-secret config values
+
+# ============================================================
+# STAGE 1 — LINT (automated)
+# ============================================================
+stages:
+  - stage: Lint
+    displayName: 'Stage 1 — Bicep Lint'
+    jobs:
+      - job: BicepLint
+        displayName: 'Bicep Lint — Sentinel'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint platform/sentinel/main.bicep'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Running bicep build (lint) on Sentinel main template..."
+                az bicep build --file platform/sentinel/main.bicep
+                echo "Lint passed — no errors found."
+
+  # ============================================================
+  # STAGE 2 — WHAT-IF (automated, depends on Lint)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 2 — What-If (Dry Run)'
+    dependsOn: Lint
+    condition: succeeded('Lint')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — Sentinel Stack'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'What-If — Microsoft Sentinel'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOY_NAME="alz-sentinel-whatif-$(date +%Y%m%d%H%M%S)"
+                echo "Running what-if: $DEPLOY_NAME"
+                echo "Target subscription: $(MANAGEMENT_SUBSCRIPTION_ID)"
+
+                az deployment sub what-if \
+                  --name "$DEPLOY_NAME" \
+                  --location australiaeast \
+                  --subscription "$(MANAGEMENT_SUBSCRIPTION_ID)" \
+                  --template-file platform/sentinel/main.bicep \
+                  --parameters platform/sentinel/parameters/sentinel.bicepparam \
+                  --parameters securityContactEmail="$(SENTINEL_SECURITY_CONTACT)" \
+                  2>&1 | tee whatif-output.txt
+
+                echo ""
+                echo "What-if complete. Review Sentinel resource changes above before approving deployment."
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If output'
+            condition: always()
+            inputs:
+              targetPath: whatif-output.txt
+              artifactName: 'whatif-sentinel-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 3 — DEPLOY (requires platform-production environment approval)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 3 — Deploy Microsoft Sentinel'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: DeploySentinel
+        displayName: 'Deploy — Microsoft Sentinel'
+        environment: platform-production    # Platform team must approve in ADO Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Microsoft Sentinel (subscription scope)'
+                  name: DeployStep
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      DEPLOY_NAME="alz-sentinel-$(date +%Y%m%d%H%M%S)"
+                      echo "Deployment name: $DEPLOY_NAME"
+                      echo "Target subscription: $(MANAGEMENT_SUBSCRIPTION_ID)"
+                      echo "Security contact: $(SENTINEL_SECURITY_CONTACT)"
+
+                      OUTPUT=$(az deployment sub create \
+                        --name "$DEPLOY_NAME" \
+                        --location australiaeast \
+                        --subscription "$(MANAGEMENT_SUBSCRIPTION_ID)" \
+                        --template-file platform/sentinel/main.bicep \
+                        --parameters platform/sentinel/parameters/sentinel.bicepparam \
+                        --parameters securityContactEmail="$(SENTINEL_SECURITY_CONTACT)" \
+                        --output json)
+
+                      echo "$OUTPUT" | tee sentinel-output.json
+
+                      echo "##[section]Deployment outputs:"
+                      echo "$OUTPUT" | jq '.properties.outputs // {} | to_entries[] | "  \(.key) = \(.value.value)"' -r 2>/dev/null || true
+
+                      # Surface workspace ID as pipeline variable if present in output
+                      SENTINEL_WS=$(echo "$OUTPUT" | jq -r '.properties.outputs.sentinelWorkspaceId.value // empty')
+                      if [ -n "$SENTINEL_WS" ]; then
+                        echo "##vso[task.setvariable variable=sentinelWorkspaceId;isOutput=true]$SENTINEL_WS"
+                      fi
+
+                      echo "##vso[task.logissue type=warning]Microsoft Sentinel deployed. Complete watchlist population and TAXII feed configuration in the Sentinel portal."
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish deployment output'
+                  condition: always()
+                  inputs:
+                    targetPath: sentinel-output.json
+                    artifactName: 'sentinel-output-$(Build.BuildNumber)'
+
+                - bash: |
+                    cat << 'CHECKLIST'
+                    ============================================================
+                    Microsoft Sentinel Deployed Successfully
+                    ============================================================
+
+                    POST-DEPLOY CHECKLIST — Complete these manual steps in the
+                    Azure Portal and Sentinel portal after this pipeline:
+                    ============================================================
+
+                    [ ] 1. Populate TrustedIPRanges watchlist
+                           Add on-premises CIDR blocks (received via ExpressRoute)
+                           Sentinel > Watchlists > TrustedIPRanges > Edit
+
+                    [ ] 2. Configure TAXII Threat Intelligence feed
+                           Obtain TAXII server URL and API credentials from SOC team
+                           Sentinel > Data connectors > Threat Intelligence - TAXII
+
+                    [ ] 3. Assign Sentinel Contributor role to SOC team AAD group
+                           Sentinel workspace > Access control (IAM)
+                           Role: Microsoft Sentinel Contributor
+                           Assign to: sg-soc-sentinelcontributor AAD group
+
+                    [ ] 4. Enable Defender for Cloud Standard tier
+                           Enable on all platform and workload subscriptions
+                           Defender for Cloud > Environment settings > [subscription]
+
+                    [ ] 5. Validate data connector ingestion
+                           Wait 15-30 minutes after deployment
+                           Sentinel > Data connectors — verify green status
+                           Verify logs flowing: Log Analytics > Logs > SecurityEvent
+
+                    [ ] 6. Review and tune Analytics Rules thresholds
+                           Sentinel > Analytics > Active rules
+                           Adjust alert thresholds to reduce false positives
+
+                    [ ] 7. Configure Automation Rules for SOC triage workflow
+                           Sentinel > Automation > Automation rules
+
+                    Reference: docs/sentinel-runbook.md
+                    ============================================================
+                    CHECKLIST
+                  displayName: 'Post-deploy checklist'

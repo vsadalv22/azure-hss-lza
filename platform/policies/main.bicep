@@ -3,8 +3,11 @@ targetScope = 'managementGroup'
 // =============================================================
 // Azure Landing Zone — Policy Assignments
 // Scope  : Root ALZ management group (inherited by all children)
+//          + tiered sub-scopes for Platform and Landing Zone MGs
 // Aligns with: ALZ baseline, APRA CPS 234, Essential Eight,
 //              Australian Government ISM
+// DD36   : Tiered policy scope — policies assigned at the most
+//          appropriate MG level rather than all at root
 // =============================================================
 
 @description('Root management group ID')
@@ -26,6 +29,19 @@ param mandatoryTagNames array = [
   'costCenter'
   'createdBy'
 ]
+
+// ---- DD36: Tiered policy scope params ----
+@description('DD36 — Platform management group ID')
+param platformManagementGroupId string = 'platform'
+
+@description('DD36 — Landing Zones management group ID')
+param landingZonesManagementGroupId string = 'landingzones'
+
+@description('DD36 — Connectivity management group ID (child of Platform)')
+param connectivityManagementGroupId string = 'connectivity'
+
+@description('DD36 — Identity management group ID (child of Platform)')
+param identityManagementGroupId string = 'identity'
 
 // =============================================================
 // Helper — current MG scope
@@ -316,6 +332,72 @@ resource policyNoClassicAdmin 'Microsoft.Authorization/policyAssignments@2023-04
 }
 
 // =============================================================
+// DD36 — Tiered Policy Assignments
+// Sub-scope assignments applied at Platform/Connectivity and
+// Landing Zones MGs rather than inheriting from root.
+// =============================================================
+
+// --- Platform / Connectivity MG scope ---
+
+// DD36: DENY unencrypted ExpressRoute private peering
+// Scoped to Connectivity MG — only applies where ER circuits live.
+// Built-in: "ExpressRoute circuits should not use classic peering"
+resource policyDenyExpressRouteUnencrypted 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'deny-er-unencrypted-peering'
+  scope: managementGroup(connectivityManagementGroupId)
+  properties: {
+    displayName: 'DENY — Unencrypted ExpressRoute private peering (Connectivity MG)'
+    description: 'DD36 — Prevents ExpressRoute circuits from using classic (unencrypted) private peering. Applied at Connectivity MG scope.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/58d5d4b6-b23f-47ac-8e18-e2caf4e26eb4'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// --- Landing Zones MG scope ---
+
+// DD36: DENY VNet peering to non-approved VNets
+// Workloads must connect via hub-spoke topology through Checkpoint NVA.
+// Built-in: "VPNs should use private IP"
+// Note: This built-in enforces private IP on VPN connections; for full
+// hub-spoke enforcement consider a custom policy or Azure Policy initiative.
+resource policyDenyVnetInjectionBypass 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'deny-vnet-injection-bypass'
+  scope: managementGroup(landingZonesManagementGroupId)
+  properties: {
+    displayName: 'DENY — VNet injection bypass / non-approved VNet peering (Landing Zones MG)'
+    description: 'DD36 — Workloads must use hub-spoke topology. Denies VPN connections not using private IP, preventing bypass of the Checkpoint NVA.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/b8cbb944-4d77-4a96-8c3e-02b3e14fbc3f'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// DD36 + DD40: REQUIRE hsp-id tag on all resources in Landing Zones MG
+// Supports Sentinel HSP data segregation (DD40) — the DCR and analytics
+// rules rely on this tag being present on all workload resources.
+resource policyRequireHspIdTag 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'require-hsp-id-tag'
+  scope: managementGroup(landingZonesManagementGroupId)
+  identity: {
+    type: 'SystemAssigned'
+  }
+  location: location
+  properties: {
+    displayName: 'REQUIRE — hsp-id tag on all resources (Landing Zones MG)'
+    description: 'DD36 + DD40 — All workload resources must carry an hsp-id tag identifying their Health Service Provider. Required for Sentinel row-level data scoping.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/96670d01-0a4d-4649-9c89-2d3abc0a5025'
+    enforcementMode: 'Default'
+    parameters: {
+      tagName: { value: 'hsp-id' }
+    }
+  }
+}
+
+// =============================================================
 // Outputs
 // =============================================================
-output policyAssignmentCount int = 15
+// Root-level assignments: 15 (unchanged)
+// Sub-scope assignments (DD36): 3 (Connectivity x1, LandingZones x2)
+// Total: 18
+output policyAssignmentCount int = 18

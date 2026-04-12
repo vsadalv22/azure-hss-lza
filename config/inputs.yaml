@@ -95,6 +95,44 @@ network_settings:
     # connection_name: "con-ergw-to-circuit-001"
     # routing_weight: 0
 
+  # ---- DD31: Dual Security VNet (Ingress / DMZ) ----
+  ingress_vnet:
+    name: "vnet-ingress-australiaeast-001"
+    address_prefix: "10.1.0.0/16"
+    subnets:
+      - name: "snet-checkpoint-external"
+        address_prefix: "10.1.0.0/28"
+      - name: "snet-ingress-dmz"
+        address_prefix: "10.1.1.0/24"
+
+  # ---- DD34: DDoS Protection Standard ----
+  ddos_protection:
+    enabled: true
+    plan_name: "ddos-plan-australiaeast-001"
+    # NOTE: DDoS Protection Standard has a flat monthly cost (~$2,944 AUD/month)
+    # Apply to internet-facing hub VNets only
+
+# ---- Perth Extended Zone (PEZ) — Secondary Location ----
+# DD17: PEZ provides a secondary deployment point closer to WA Health datacentres
+# DD22: PEZ uses single fault domain — no Availability Zone support
+pez_settings:
+  enabled: true
+  edge_zone: "perth"           # Azure Extended Zone name for Perth
+  hub_vnet_name: "vnet-hub-pez-001"
+  hub_vnet_address_prefix: "10.2.0.0/16"
+  ingress_vnet_name: "vnet-ingress-pez-001"
+  ingress_vnet_address_prefix: "10.3.0.0/16"
+  gateway_name: "ergw-hub-pez-001"
+  gateway_sku: "ErGw1"         # No AZ suffix — PEZ single fault domain (DD22)
+  expressroute:
+    # ── Deployed by IaC ───────────────────────────────────────
+    gateway_name: "ergw-hub-pez-001"
+    gateway_sku: "ErGw1"       # Standard, no zone-redundancy in PEZ
+    # ── Created MANUALLY (not in code) ────────────────────────
+    # circuit_name: "erc-hub-pez-001"
+    # peering_location: "Perth"   # ER Direct location
+    # nextdc_facility: "P1"       # NextDC P1 Perth (primary) or P2 (secondary)
+
 # ---- Logging & Monitoring ----
 logging_settings:
   log_analytics_workspace_name: "law-management-australiaeast-001"
@@ -129,6 +167,7 @@ sentinel_settings:
     - MassResourceDeletion
     - NvaConfigChange
     - PasswordSpray
+    - HspCrossTenantResourceAccess  # DD40
 
 # ---- Identity ----
 identity_settings:
@@ -149,3 +188,29 @@ subscription_vending:
   tags:
     environment: "production"
     managed_by: "platform-team"
+
+# ---- Health Service Provider (HSP) Configuration ----
+# Used for Sentinel data segregation (DD40) and policy tagging
+hsp_settings:
+  enabled: true
+  hsp_list:
+    - id: "perth-childrens"
+      display_name: "Perth Children's Hospital"
+    - id: "fiona-stanley"
+      display_name: "Fiona Stanley Hospital"
+    - id: "rpbg"
+      display_name: "Royal Perth Bentley Group"
+    - id: "smhs"
+      display_name: "South Metropolitan Health Service"
+    - id: "nmhs"
+      display_name: "North Metropolitan Health Service"
+
+# ---- CI/CD Platform — Azure DevOps ----
+# DD03: ADO is the mandated enterprise DevSecOps platform
+# GitHub Actions files are retained for reference only
+devops_settings:
+  platform: "azure-devops"
+  organization: ""             # e.g. https://dev.azure.com/wahealthhss
+  project: ""                  # e.g. azure-cloud-platform
+  service_connection: "hss-platform-azure-sc"
+  pipeline_directory: "azure-pipelines"

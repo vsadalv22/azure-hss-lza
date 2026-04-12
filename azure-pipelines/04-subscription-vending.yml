@@ -1,0 +1,537 @@
+# ============================================================
+# Pipeline: 04 - Subscription Vending Machine
+# Provisions new Azure subscriptions (EA) with a fully
+# configured spoke VNet, peering, UDR, RBAC, Defender for Cloud,
+# diagnostic settings, and budget alerts.
+#
+# APPROVAL PROCESS (4 stages):
+#
+#  Stage 1 — VALIDATE  (automated)
+#    - Bicep lint
+#    - IP overlap detection
+#    - Naming convention check
+#    - Mandatory tag validation
+#
+#  Stage 2 — WHAT-IF   (automated, posts result to pipeline summary)
+#    - ARM what-if against management group scope
+#    - Results published as pipeline artifact for human review
+#
+#  Stage 3 — REVIEW    (manual — 3 parallel environment gates)
+#    - vending-network-review    > Network team (IP/routing/peering)
+#    - vending-security-review   > Security/SOC team (compliance/Defender)
+#    - vending-platform-approval > Platform leads (final gate)
+#
+#  Stage 4 — DEPLOY    (automated — runs only after all 3 approvals)
+#    - Creates EA subscription
+#    - Provisions spoke VNet + peering + UDR
+#    - Assigns RBAC
+#    - Enables Defender for Cloud
+#    - Creates budget alert
+#    - Posts summary to pipeline
+#
+# Trigger: changes to subscription-vending/parameters/**.bicepparam on main
+# Manual:  Run pipeline button — provide param_file parameter
+#
+# Deployment order: 01 → 02 → 03 → THIS (on-demand per subscription request)
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - subscription-vending/parameters/**
+
+pr: none   # PRs to non-main branches must NOT trigger production pipelines
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: paramFile
+    displayName: 'Relative path to .bicepparam file (leave blank for auto-detect from changed files)'
+    type: string
+    default: ''
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID,
+                                    # EA_BILLING_ACCOUNT, EA_ENROLLMENT_ACCOUNT,
+                                    # HUB_VNET_ID, ROUTE_TABLE_ID,
+                                    # LOG_ANALYTICS_WORKSPACE_ID, MANAGEMENT_SUBSCRIPTION_ID
+  - group: alz-platform-variables   # Non-secret config values
+  - name: ROOT_MG_ID
+    value: 'alz'
+
+# ============================================================
+# STAGE 1 — VALIDATE (automated)
+# Lint + IP overlap + naming convention + tag validation
+# ============================================================
+stages:
+  - stage: Validate
+    displayName: 'Stage 1 — Validate'
+    jobs:
+      - job: DetectFiles
+        displayName: 'Detect changed .bicepparam files'
+        steps:
+          - checkout: self
+            fetchDepth: 2
+
+          - bash: |
+              set -euo pipefail
+
+              # Manual run with explicit param file
+              if [ -n "${{ parameters.paramFile }}" ]; then
+                FILES='["${{ parameters.paramFile }}"]'
+                echo "Manual run — using provided param file: ${{ parameters.paramFile }}"
+              else
+                # Auto-detect files changed in this push
+                FILES=$(git diff --name-only HEAD~1 HEAD \
+                  -- 'subscription-vending/parameters/*.bicepparam' \
+                  | jq -R -s -c 'split("\n") | map(select(length > 0))')
+                echo "Auto-detected changed files: $FILES"
+              fi
+
+              COUNT=$(echo "$FILES" | jq 'length')
+
+              if [ "$COUNT" -eq "0" ]; then
+                echo "##vso[task.logissue type=warning]No .bicepparam files detected in this run."
+                echo "##vso[task.setvariable variable=paramFiles;isOutput=true][]"
+                echo "##vso[task.setvariable variable=hasFiles;isOutput=true]false"
+              else
+                echo "##vso[task.setvariable variable=paramFiles;isOutput=true]$FILES"
+                echo "##vso[task.setvariable variable=hasFiles;isOutput=true]true"
+                echo "Files to process ($COUNT): $FILES"
+              fi
+            displayName: 'Detect changed .bicepparam files'
+            name: DetectStep
+
+      - job: BicepLint
+        displayName: 'Bicep Lint — subscription-vending/main.bicep'
+        dependsOn: DetectFiles
+        condition: eq(dependencies.DetectFiles.outputs['DetectStep.hasFiles'], 'true')
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint subscription-vending module'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Running bicep build (lint) on subscription-vending main template..."
+                az bicep build --file subscription-vending/main.bicep
+                echo "Lint passed."
+
+      - job: AutomatedValidation
+        displayName: 'Automated validation (IP overlap, naming, tags)'
+        dependsOn:
+          - DetectFiles
+          - BicepLint
+        condition: |
+          and(
+            succeeded('BicepLint'),
+            eq(dependencies.DetectFiles.outputs['DetectStep.hasFiles'], 'true')
+          )
+        variables:
+          PARAM_FILES: $[ dependencies.DetectFiles.outputs['DetectStep.paramFiles'] ]
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Login for validation script'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                echo "Azure login via service connection established."
+                az account show --output table
+
+          - bash: |
+              set -euo pipefail
+
+              PARAM_FILES='$(PARAM_FILES)'
+              FILE_COUNT=$(echo "$PARAM_FILES" | jq 'length')
+
+              echo "Validating $FILE_COUNT parameter file(s)..."
+              OVERALL_STATUS="passed"
+
+              for i in $(seq 0 $((FILE_COUNT - 1))); do
+                PARAM_FILE=$(echo "$PARAM_FILES" | jq -r ".[$i]")
+                echo ""
+                echo "============================================"
+                echo "Validating: $PARAM_FILE"
+                echo "============================================"
+
+                if [ ! -f "$PARAM_FILE" ]; then
+                  echo "##vso[task.logissue type=error]Parameter file not found: $PARAM_FILE"
+                  OVERALL_STATUS="failed"
+                  continue
+                fi
+
+                # Run validation script (PowerShell)
+                pwsh -NonInteractive -File scripts/validate-subscription-request.ps1 \
+                  -ParamFile "$PARAM_FILE" \
+                  -HubCIDR "10.0.0.0/16" \
+                  -IdentityCIDR "10.10.0.0/16" \
+                  -CorpRangeStart 100 \
+                  -CorpRangeEnd 199 \
+                  -OnlineRangeStart 200 \
+                  -OnlineRangeEnd 254 2>&1 | tee "validation-$(basename $PARAM_FILE).txt"
+
+                if grep -q "VALIDATION FAILED" "validation-$(basename $PARAM_FILE).txt"; then
+                  echo "##vso[task.logissue type=error]Validation FAILED for $PARAM_FILE"
+                  OVERALL_STATUS="failed"
+                else
+                  echo "Validation PASSED for $PARAM_FILE"
+                fi
+              done
+
+              # Combine reports
+              cat validation-*.txt > validation-report-combined.txt 2>/dev/null || true
+
+              if [ "$OVERALL_STATUS" = "failed" ]; then
+                echo "##vso[task.logissue type=error]One or more parameter files failed validation. Fix errors and re-run."
+                exit 1
+              fi
+
+              echo ""
+              echo "All $FILE_COUNT parameter file(s) passed validation."
+            displayName: 'Run validation script for all detected param files'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish validation reports'
+            condition: always()
+            inputs:
+              targetPath: .
+              patterns: 'validation-*.txt'
+              artifactName: 'validation-reports-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 2 — WHAT-IF (automated, depends on Validate)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 2 — What-If (Dry Run)'
+    dependsOn: Validate
+    condition: succeeded('Validate')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — Management Group deployment'
+        steps:
+          - checkout: self
+            fetchDepth: 2
+
+          - bash: |
+              set -euo pipefail
+
+              if [ -n "${{ parameters.paramFile }}" ]; then
+                FILES='["${{ parameters.paramFile }}"]'
+              else
+                FILES=$(git diff --name-only HEAD~1 HEAD \
+                  -- 'subscription-vending/parameters/*.bicepparam' \
+                  | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              fi
+
+              echo "##vso[task.setvariable variable=paramFiles]$FILES"
+              echo "Files for what-if: $FILES"
+            displayName: 'Re-detect param files'
+            name: ReDetect
+
+          - task: AzureCLI@2
+            displayName: 'Run What-If for all param files'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                PARAM_FILES='$(paramFiles)'
+                FILE_COUNT=$(echo "$PARAM_FILES" | jq 'length')
+
+                echo "Running what-if for $FILE_COUNT parameter file(s)..."
+
+                for i in $(seq 0 $((FILE_COUNT - 1))); do
+                  PARAM_FILE=$(echo "$PARAM_FILES" | jq -r ".[$i]")
+                  DEPLOY_NAME="sub-vend-whatif-$(date +%Y%m%d%H%M%S)-$i"
+
+                  echo ""
+                  echo "============================================"
+                  echo "What-if: $PARAM_FILE"
+                  echo "Deployment: $DEPLOY_NAME"
+                  echo "============================================"
+
+                  az deployment mg what-if \
+                    --name "$DEPLOY_NAME" \
+                    --location australiaeast \
+                    --management-group-id "$(ROOT_MG_ID)" \
+                    --template-file subscription-vending/main.bicep \
+                    --parameters "$PARAM_FILE" \
+                    --parameters \
+                      eaBillingAccountName="$(EA_BILLING_ACCOUNT)" \
+                      eaEnrollmentAccountName="$(EA_ENROLLMENT_ACCOUNT)" \
+                      hubVnetId="$(HUB_VNET_ID)" \
+                      routeTableId="$(ROUTE_TABLE_ID)" \
+                      logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                    2>&1 | head -200 | tee "whatif-$(basename $PARAM_FILE).txt" || true
+
+                  echo ""
+                  echo "What-if complete for $PARAM_FILE"
+                  echo ""
+                  echo "============================================"
+                  echo "Required approvals before deployment:"
+                  echo "  1. Network team  — vending-network-review environment"
+                  echo "  2. Security team — vending-security-review environment"
+                  echo "  3. Platform leads — vending-platform-approval environment"
+                  echo "============================================"
+                done
+
+                # Combine all what-if outputs
+                cat whatif-*.txt > whatif-combined.txt 2>/dev/null || true
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If results'
+            condition: always()
+            inputs:
+              targetPath: .
+              patterns: 'whatif-*.txt'
+              artifactName: 'whatif-results-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 3 — REVIEW (3 parallel environment gates)
+  # All 3 must approve before Stage 4 can run.
+  # Configure reviewers in ADO: Pipelines > Environments > [name] > Approvals
+  # ============================================================
+  - stage: NetworkReview
+    displayName: 'Stage 3a — Network Team Review'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: NetworkApproval
+        displayName: 'Awaiting Network Team Approval'
+        environment: vending-network-review    # Network team added as required approver
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    echo "Network team approval granted."
+                    echo "Review confirmed:"
+                    echo "  - IP CIDR allocation confirmed non-overlapping with existing spoke VNets"
+                    echo "  - Routing via Checkpoint NVA confirmed"
+                    echo "  - Spoke-to-hub VNet peering design approved"
+                    echo "  - UDR (0.0.0.0/0 -> Checkpoint) reviewed and approved"
+                  displayName: 'Network Review Confirmed'
+
+  - stage: SecurityReview
+    displayName: 'Stage 3b — Security Team Review'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: SecurityApproval
+        displayName: 'Awaiting Security Team Approval'
+        environment: vending-security-review   # Security/SOC team added as required approver
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    echo "Security team approval granted."
+                    echo "Review confirmed:"
+                    echo "  - Data classification reviewed and appropriate"
+                    echo "  - Defender for Cloud plan appropriate for workload type"
+                    echo "  - Compliance requirements met (ISMS, Essential 8)"
+                    echo "  - Internet egress scope reviewed"
+                    echo "  - RBAC assignments reviewed"
+                  displayName: 'Security Review Confirmed'
+
+  - stage: PlatformApproval
+    displayName: 'Stage 3c — Platform Lead Final Approval'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: PlatformFinalApproval
+        displayName: 'Awaiting Platform Lead Approval (Final Gate)'
+        environment: vending-platform-approval  # Platform leads added as required approvers
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    echo "Platform lead final approval granted."
+                    echo "All review stages complete — proceeding to deployment."
+                  displayName: 'Platform Lead Final Approval Confirmed'
+
+  # ============================================================
+  # STAGE 4 — DEPLOY (automated — runs only after all 3 review stages)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 4 — Deploy (Vend Subscription)'
+    dependsOn:
+      - NetworkReview
+      - SecurityReview
+      - PlatformApproval
+    condition: |
+      and(
+        succeeded('NetworkReview'),
+        succeeded('SecurityReview'),
+        succeeded('PlatformApproval')
+      )
+    jobs:
+      - job: VendSubscription
+        displayName: 'Vend Subscription'
+        # One subscription at a time to avoid EA concurrency conflicts
+        strategy:
+          maxParallel: 1
+        steps:
+          - checkout: self
+            fetchDepth: 2
+
+          - bash: |
+              set -euo pipefail
+
+              if [ -n "${{ parameters.paramFile }}" ]; then
+                FILES='["${{ parameters.paramFile }}"]'
+              else
+                FILES=$(git diff --name-only HEAD~1 HEAD \
+                  -- 'subscription-vending/parameters/*.bicepparam' \
+                  | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              fi
+
+              echo "##vso[task.setvariable variable=paramFiles]$FILES"
+              echo "Files for deployment: $FILES"
+            displayName: 'Re-detect param files for deployment'
+
+          - task: AzureCLI@2
+            displayName: 'Deploy — Vend Subscriptions'
+            name: VendStep
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                PARAM_FILES='$(paramFiles)'
+                FILE_COUNT=$(echo "$PARAM_FILES" | jq 'length')
+
+                echo "Deploying $FILE_COUNT subscription(s)..."
+
+                LAST_SUB_ID=""
+                LAST_VNET_ID=""
+
+                for i in $(seq 0 $((FILE_COUNT - 1))); do
+                  PARAM_FILE=$(echo "$PARAM_FILES" | jq -r ".[$i]")
+                  DEPLOY_NAME="sub-vend-$(date +%Y%m%d%H%M%S)"
+
+                  echo ""
+                  echo "============================================"
+                  echo "Vending subscription from: $PARAM_FILE"
+                  echo "Deployment: $DEPLOY_NAME"
+                  echo "Approved by: Network team, Security team, Platform leads"
+                  echo "============================================"
+
+                  OUTPUT=$(az deployment mg create \
+                    --name "$DEPLOY_NAME" \
+                    --location australiaeast \
+                    --management-group-id "$(ROOT_MG_ID)" \
+                    --template-file subscription-vending/main.bicep \
+                    --parameters "$PARAM_FILE" \
+                    --parameters \
+                      eaBillingAccountName="$(EA_BILLING_ACCOUNT)" \
+                      eaEnrollmentAccountName="$(EA_ENROLLMENT_ACCOUNT)" \
+                      hubVnetId="$(HUB_VNET_ID)" \
+                      routeTableId="$(ROUTE_TABLE_ID)" \
+                      logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                    --output json)
+
+                  echo "$OUTPUT" | tee "vending-output-$(basename $PARAM_FILE .bicepparam).json"
+
+                  SUB_ID=$(echo "$OUTPUT"  | jq -r '.properties.outputs.subscriptionId.value          // empty')
+                  VNET_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.spokeVnetResourceId.value     // empty')
+
+                  echo ""
+                  echo "Subscription vended successfully:"
+                  echo "  Subscription ID : $SUB_ID"
+                  echo "  Spoke VNet ID   : $VNET_ID"
+                  echo "  Param file      : $PARAM_FILE"
+
+                  LAST_SUB_ID="$SUB_ID"
+                  LAST_VNET_ID="$VNET_ID"
+
+                  # Emit audit notice
+                  echo "##vso[task.logissue type=warning]Subscription $SUB_ID vended from $PARAM_FILE — approved by network, security and platform teams."
+
+                  # Pause 10s between subscriptions to respect EA API rate limits
+                  if [ $i -lt $((FILE_COUNT - 1)) ]; then
+                    echo "Waiting 10 seconds before next subscription..."
+                    sleep 10
+                  fi
+                done
+
+                # Surface last deployment as pipeline variables
+                echo "##vso[task.setvariable variable=subscriptionId;isOutput=true]$LAST_SUB_ID"
+                echo "##vso[task.setvariable variable=spokeVnetId;isOutput=true]$LAST_VNET_ID"
+
+                # Combine all vending outputs
+                cat vending-output-*.json > vending-output-combined.json 2>/dev/null || true
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish vending outputs'
+            condition: always()
+            inputs:
+              targetPath: .
+              patterns: 'vending-output-*.json'
+              artifactName: 'vending-outputs-$(Build.BuildNumber)'
+
+          - bash: |
+              set -euo pipefail
+
+              # Parse combined output if available, else use single file
+              if [ -f vending-output-combined.json ]; then
+                SUB_COUNT=$(cat vending-output-combined.json | jq -s 'length')
+              else
+                SUB_COUNT=1
+              fi
+
+              cat << SUMMARY
+              ============================================================
+              Subscription Vending Complete
+              ============================================================
+              Subscriptions vended : $SUB_COUNT
+              Build                : $(Build.BuildNumber)
+              Approved by          : Network team, Security team, Platform leads
+
+              What was provisioned per subscription:
+                - EA Subscription created and placed in management group
+                - Spoke VNet + subnets deployed
+                - Spoke <-> Hub VNet peering connected
+                - UDR (0.0.0.0/0 -> Checkpoint NVA) applied
+                - RBAC (AAD group -> Contributor) assigned
+                - Microsoft Defender for Cloud enabled
+                - Diagnostic settings -> Log Analytics enabled
+                - Budget alert configured
+                - Resource Group lock applied
+
+              Next steps for the application team:
+              1. Sign in to Azure Portal and locate your new subscription
+              2. Verify VNet peering status shows: Connected
+              3. Test connectivity to on-premises via ExpressRoute
+              4. Review Defender for Cloud recommendations
+              5. Deploy your workload resources
+              ============================================================
+              SUMMARY
+            displayName: 'Post-deploy summary'

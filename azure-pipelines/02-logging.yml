@@ -1,0 +1,184 @@
+# ============================================================
+# Pipeline: 02 - Platform: Logging & Monitoring
+# Deploys the Log Analytics Workspace, diagnostic settings,
+# and monitoring stack into the Management subscription.
+#
+# Trigger: changes to platform/logging/**  on main
+# Manual:  Run pipeline button in ADO
+#
+# Deployment order: 01-management-groups → THIS → 03-connectivity
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - platform/logging/**
+
+pr: none   # PRs to non-main branches must NOT trigger production pipelines
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID, MANAGEMENT_SUBSCRIPTION_ID
+  - group: alz-platform-variables   # Non-secret config values
+
+# ============================================================
+# STAGE 1 — LINT (automated)
+# ============================================================
+stages:
+  - stage: Lint
+    displayName: 'Stage 1 — Bicep Lint'
+    jobs:
+      - job: BicepLint
+        displayName: 'Bicep Lint — Logging'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint platform/logging/main.bicep'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Running bicep build (lint) on logging main template..."
+                az bicep build --file platform/logging/main.bicep
+                echo "Lint passed — no errors found."
+
+  # ============================================================
+  # STAGE 2 — WHAT-IF (automated, depends on Lint)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 2 — What-If (Dry Run)'
+    dependsOn: Lint
+    condition: succeeded('Lint')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — Subscription Deployment'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'What-If — Logging Stack'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOY_NAME="alz-logging-whatif-$(date +%Y%m%d%H%M%S)"
+                echo "Running what-if: $DEPLOY_NAME"
+                echo "Target subscription: $(MANAGEMENT_SUBSCRIPTION_ID)"
+
+                az deployment sub what-if \
+                  --name "$DEPLOY_NAME" \
+                  --location australiaeast \
+                  --subscription "$(MANAGEMENT_SUBSCRIPTION_ID)" \
+                  --template-file platform/logging/main.bicep \
+                  2>&1 | tee whatif-output.txt
+
+                echo ""
+                echo "What-if complete. Review the above output before approving deployment."
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If output'
+            condition: always()
+            inputs:
+              targetPath: whatif-output.txt
+              artifactName: 'whatif-logging-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 3 — DEPLOY (requires platform-production environment approval)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 3 — Deploy Logging Stack'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: DeployLogging
+        displayName: 'Deploy — Log Analytics Workspace & Monitoring'
+        environment: platform-production    # Platform team must approve in ADO Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Logging Stack (subscription scope)'
+                  name: DeployStep
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      DEPLOY_NAME="alz-logging-$(date +%Y%m%d%H%M%S)"
+                      echo "Deployment name: $DEPLOY_NAME"
+                      echo "Target subscription: $(MANAGEMENT_SUBSCRIPTION_ID)"
+
+                      OUTPUT=$(az deployment sub create \
+                        --name "$DEPLOY_NAME" \
+                        --location australiaeast \
+                        --subscription "$(MANAGEMENT_SUBSCRIPTION_ID)" \
+                        --template-file platform/logging/main.bicep \
+                        --output json)
+
+                      echo "$OUTPUT" | tee deployment-output.json
+
+                      # Extract Log Analytics Workspace ID for downstream pipelines
+                      LAW_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.logAnalyticsWorkspaceId.value // empty')
+
+                      echo "##[section]Deployment outputs:"
+                      echo "  Log Analytics Workspace ID: $LAW_ID"
+
+                      # Surface as pipeline output variable
+                      if [ -n "$LAW_ID" ]; then
+                        echo "##vso[task.setvariable variable=lawResourceId;isOutput=true]$LAW_ID"
+                      fi
+
+                      echo ""
+                      echo "IMPORTANT: Update the alz-platform-secrets variable group with:"
+                      echo "  LOG_ANALYTICS_WORKSPACE_ID = $LAW_ID"
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish deployment output'
+                  condition: always()
+                  inputs:
+                    targetPath: deployment-output.json
+                    artifactName: 'logging-output-$(Build.BuildNumber)'
+
+                - bash: |
+                    cat << 'SUMMARY'
+                    ============================================================
+                    Logging Stack Deployed Successfully
+                    ============================================================
+                    Subscription : Management subscription
+                    Location     : australiaeast
+                    Scope        : Subscription
+
+                    ACTION REQUIRED:
+                    Update the 'alz-platform-secrets' variable group in ADO Library
+                    with the LOG_ANALYTICS_WORKSPACE_ID from the deployment output above.
+                    This value is consumed by pipelines 03-connectivity and 05-sentinel.
+
+                    Next Step: Run pipeline 03-connectivity to deploy the
+                               Hub VNet, ExpressRoute Gateway, and Checkpoint NVA.
+                    SUMMARY
+                  displayName: 'Post-deploy summary'

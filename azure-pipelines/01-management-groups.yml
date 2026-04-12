@@ -1,0 +1,176 @@
+# ============================================================
+# Pipeline: 01 - Platform: Management Groups
+# Deploys the ALZ management group hierarchy at tenant scope.
+#
+# Trigger: changes to platform/management-groups/**  on main
+# Manual:  Run pipeline button in ADO (no extra parameters)
+#
+# Deployment order: THIS IS PIPELINE 1 OF 6
+#   01 (this) → 02-logging → 03-connectivity → 03b-er-connection
+#                          → 04-subscription-vending → 05-sentinel
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - platform/management-groups/**
+
+pr: none   # PRs to non-main branches must NOT trigger production pipelines
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID, etc.
+  - group: alz-platform-variables   # Non-secret config values
+  - name: ROOT_MANAGEMENT_GROUP_ID
+    value: 'alz'
+
+# ============================================================
+# STAGE 1 — LINT (automated)
+# ============================================================
+stages:
+  - stage: Lint
+    displayName: 'Stage 1 — Bicep Lint'
+    jobs:
+      - job: BicepLint
+        displayName: 'Bicep Lint — Management Groups'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint platform/management-groups/main.bicep'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Running bicep build (lint) on management-groups main template..."
+                az bicep build --file platform/management-groups/main.bicep
+                echo "Lint passed — no errors found."
+
+  # ============================================================
+  # STAGE 2 — WHAT-IF (automated, depends on Lint)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 2 — What-If (Dry Run)'
+    dependsOn: Lint
+    condition: succeeded('Lint')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — Tenant Deployment'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'What-If — Management Group Hierarchy'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOY_NAME="alz-management-groups-whatif-$(date +%Y%m%d%H%M%S)"
+                echo "Running what-if: $DEPLOY_NAME"
+
+                az deployment tenant what-if \
+                  --name "$DEPLOY_NAME" \
+                  --location australiaeast \
+                  --template-file platform/management-groups/main.bicep \
+                  --parameters rootManagementGroupId="$(ROOT_MANAGEMENT_GROUP_ID)" \
+                  2>&1 | tee whatif-output.txt
+
+                echo ""
+                echo "What-if complete. Review the above output before approving deployment."
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If output'
+            condition: always()
+            inputs:
+              targetPath: whatif-output.txt
+              artifactName: 'whatif-management-groups-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 3 — DEPLOY (requires platform-production environment approval)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 3 — Deploy Management Groups'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: DeployManagementGroups
+        displayName: 'Deploy — Management Group Hierarchy'
+        environment: platform-production    # Platform team must approve in ADO Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy Management Group Hierarchy (tenant scope)'
+                  name: DeployStep
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    addSpnToEnvironment: true
+                    inlineScript: |
+                      set -euo pipefail
+
+                      DEPLOY_NAME="alz-management-groups-$(date +%Y%m%d%H%M%S)"
+                      echo "Deployment name: $DEPLOY_NAME"
+
+                      OUTPUT=$(az deployment tenant create \
+                        --name "$DEPLOY_NAME" \
+                        --location australiaeast \
+                        --template-file platform/management-groups/main.bicep \
+                        --parameters rootManagementGroupId="$(ROOT_MANAGEMENT_GROUP_ID)" \
+                        --output json)
+
+                      echo "$OUTPUT" | tee deployment-output.json
+
+                      echo "##[section]Deployment outputs:"
+                      echo "$OUTPUT" | jq '.properties.outputs // {} | to_entries[] | "  \(.key) = \(.value.value)"' -r
+
+                      # Surface key output as pipeline variable for downstream pipelines
+                      MG_ROOT=$(echo "$OUTPUT" | jq -r '.properties.outputs.rootManagementGroupId.value // empty')
+                      if [ -n "$MG_ROOT" ]; then
+                        echo "##vso[task.setvariable variable=rootManagementGroupId;isOutput=true]$MG_ROOT"
+                      fi
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish deployment output'
+                  condition: always()
+                  inputs:
+                    targetPath: deployment-output.json
+                    artifactName: 'management-groups-output-$(Build.BuildNumber)'
+
+                - bash: |
+                    cat << 'SUMMARY'
+                    ============================================================
+                    Management Group Hierarchy Deployed Successfully
+                    ============================================================
+                    Root MG  : alz
+                    Location : australiaeast
+                    Scope    : Tenant
+
+                    Next Step: Run pipeline 02-logging to deploy the
+                               Log Analytics Workspace and monitoring stack.
+                    SUMMARY
+                  displayName: 'Post-deploy summary'

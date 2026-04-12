@@ -1,0 +1,320 @@
+# ============================================================
+# Pipeline: 03b - Platform: ExpressRoute Connection
+# Creates the Azure connection resource that links the
+# ExpressRoute Gateway (deployed by pipeline 03) to the
+# manually-created and provider-provisioned ER circuit.
+#
+# WHEN TO RUN:
+#   Run this pipeline ONLY after ALL of the following are true:
+#     - Pipeline 03 has completed successfully
+#     - ER circuit has been created manually in Azure Portal
+#     - Service key has been sent to the provider
+#     - Provider has set circuit provisioning status to Provisioned
+#       (visible in Portal: ExpressRoute circuit > Overview >
+#        Provider status: Provisioned)
+#
+# HOW TO RUN:
+#   ADO Pipelines > 03b-er-connection > Run pipeline
+#   Required parameter: ER circuit resource ID
+#
+# Reference: docs/expressroute-setup.md
+#
+# Deployment order: 03-connectivity → THIS (manual, on-demand)
+# ============================================================
+
+trigger: none   # Manual trigger only — never auto-run on push
+
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: erCircuitResourceId
+    displayName: 'ExpressRoute Circuit Resource ID'
+    type: string
+    default: ''
+    # Format: /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Network/expressRouteCircuits/<name>
+    # Find this in Azure Portal: ExpressRoute circuit > Properties > Resource ID
+
+  - name: connectionName
+    displayName: 'Connection resource name'
+    type: string
+    default: 'con-ergw-to-circuit-001'
+    # Leave default unless creating a second connection to the same gateway
+
+  - name: routingWeight
+    displayName: 'BGP routing weight (0 = default preference)'
+    type: number
+    default: 0
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID, CONNECTIVITY_SUBSCRIPTION_ID,
+                                    # LOG_ANALYTICS_WORKSPACE_ID, ER_GATEWAY_ID
+  - group: alz-platform-variables   # Non-secret config values
+  - name: HUB_RESOURCE_GROUP
+    value: 'rg-connectivity-hub-australiaeast-001'
+
+# ============================================================
+# STAGE 1 — PRE-FLIGHT (automated — verifies circuit is provisioned)
+# ============================================================
+stages:
+  - stage: Preflight
+    displayName: 'Stage 1 — Pre-Flight Checks'
+    jobs:
+      - job: VerifyCircuit
+        displayName: 'Verify ER Circuit is Provisioned'
+        steps:
+          - checkout: self
+
+          - bash: |
+              set -euo pipefail
+
+              CIRCUIT_ID="${{ parameters.erCircuitResourceId }}"
+
+              if [ -z "$CIRCUIT_ID" ]; then
+                echo "##vso[task.logissue type=error]erCircuitResourceId parameter is required. Re-run the pipeline and provide the circuit resource ID."
+                exit 1
+              fi
+
+              echo "Circuit ID provided: $CIRCUIT_ID"
+
+              # Validate resource ID format
+              if [[ ! "$CIRCUIT_ID" =~ ^/subscriptions/.*/expressRouteCircuits/.* ]]; then
+                echo "##vso[task.logissue type=error]Circuit resource ID format is invalid."
+                echo "Expected format: /subscriptions/<id>/resourceGroups/<rg>/providers/Microsoft.Network/expressRouteCircuits/<name>"
+                echo "Provided value:  $CIRCUIT_ID"
+                exit 1
+              fi
+
+              echo "Resource ID format validated."
+            displayName: 'Validate circuit resource ID format'
+
+          - task: AzureCLI@2
+            displayName: 'Verify circuit provisioning status via Azure API'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                CIRCUIT_ID="${{ parameters.erCircuitResourceId }}"
+                echo "Querying circuit: $CIRCUIT_ID"
+
+                # Fetch circuit details — error if not found or no access
+                CIRCUIT=$(az network express-route show --ids "$CIRCUIT_ID" --output json 2>&1) || {
+                  echo "##vso[task.logissue type=error]Could not retrieve circuit. Verify the resource ID and that the service principal has Reader access to the circuit subscription."
+                  echo "$CIRCUIT"
+                  exit 1
+                }
+
+                PROVIDER_STATUS=$(echo "$CIRCUIT" | jq -r '.serviceProviderProvisioningState')
+                CIRCUIT_STATUS=$(echo "$CIRCUIT"  | jq -r '.circuitProvisioningState')
+                CIRCUIT_NAME=$(echo "$CIRCUIT"    | jq -r '.name')
+                CIRCUIT_LOCATION=$(echo "$CIRCUIT" | jq -r '.location')
+                CIRCUIT_BW=$(echo "$CIRCUIT"      | jq -r '.serviceProviderProperties.bandwidthInMbps')
+
+                echo "============================================"
+                echo "Circuit name            : $CIRCUIT_NAME"
+                echo "Location                : $CIRCUIT_LOCATION"
+                echo "Bandwidth               : ${CIRCUIT_BW} Mbps"
+                echo "Circuit provisioning    : $CIRCUIT_STATUS"
+                echo "Provider provisioning   : $PROVIDER_STATUS"
+                echo "============================================"
+
+                # Guard: provider must be Provisioned
+                if [ "$PROVIDER_STATUS" != "Provisioned" ]; then
+                  echo "##vso[task.logissue type=error]Provider status is '$PROVIDER_STATUS' — must be 'Provisioned' before creating a connection."
+                  echo "Contact your service provider (Equinix / Megaport / Telstra) to provision the circuit."
+                  exit 1
+                fi
+
+                # Guard: circuit must be Enabled
+                if [ "$CIRCUIT_STATUS" != "Enabled" ]; then
+                  echo "##vso[task.logissue type=error]Circuit provisioning state is '$CIRCUIT_STATUS' — must be 'Enabled'."
+                  exit 1
+                fi
+
+                echo "Pre-flight passed — circuit is provisioned and enabled. Safe to proceed."
+
+  # ============================================================
+  # STAGE 2 — LINT (automated, depends on Preflight)
+  # ============================================================
+  - stage: Lint
+    displayName: 'Stage 2 — Bicep Lint'
+    dependsOn: Preflight
+    condition: succeeded('Preflight')
+    jobs:
+      - job: BicepLint
+        displayName: 'Bicep Lint — ER Connection module'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint platform/connectivity/modules/er-connection.bicep'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Linting ER connection module..."
+                az bicep build --file platform/connectivity/modules/er-connection.bicep
+                echo "Lint passed."
+
+  # ============================================================
+  # STAGE 3 — WHAT-IF (automated, depends on Lint)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 3 — What-If (Dry Run)'
+    dependsOn: Lint
+    condition: succeeded('Lint')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — ER Connection'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'What-If — ER Connection resource'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOY_NAME="er-connection-whatif-$(date +%Y%m%d%H%M%S)"
+                echo "Running what-if: $DEPLOY_NAME"
+                echo "Target resource group: $(HUB_RESOURCE_GROUP)"
+                echo "Connection name: ${{ parameters.connectionName }}"
+                echo "Routing weight: ${{ parameters.routingWeight }}"
+
+                az deployment group what-if \
+                  --name "$DEPLOY_NAME" \
+                  --resource-group "$(HUB_RESOURCE_GROUP)" \
+                  --template-file platform/connectivity/modules/er-connection.bicep \
+                  --parameters \
+                    erGatewayId="$(ER_GATEWAY_ID)" \
+                    erCircuitResourceId="${{ parameters.erCircuitResourceId }}" \
+                    connectionName="${{ parameters.connectionName }}" \
+                    routingWeight=${{ parameters.routingWeight }} \
+                    logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                  2>&1 | tee whatif-output.txt
+
+                echo ""
+                echo "What-if complete. Review the connection change above."
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If output'
+            condition: always()
+            inputs:
+              targetPath: whatif-output.txt
+              artifactName: 'whatif-er-connection-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 4 — DEPLOY (requires platform-production environment approval)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 4 — Deploy ER Connection'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: DeployERConnection
+        displayName: 'Deploy — ExpressRoute Connection'
+        environment: platform-production    # Platform team must approve in ADO Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Create ER Connection resource (resource group scope)'
+                  name: DeployStep
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      DEPLOY_NAME="er-connection-$(date +%Y%m%d%H%M%S)"
+                      echo "Deployment name: $DEPLOY_NAME"
+                      echo "Target resource group: $(HUB_RESOURCE_GROUP)"
+                      echo "Connection name: ${{ parameters.connectionName }}"
+                      echo "Circuit: ${{ parameters.erCircuitResourceId }}"
+                      echo "Routing weight: ${{ parameters.routingWeight }}"
+
+                      OUTPUT=$(az deployment group create \
+                        --name "$DEPLOY_NAME" \
+                        --resource-group "$(HUB_RESOURCE_GROUP)" \
+                        --template-file platform/connectivity/modules/er-connection.bicep \
+                        --parameters \
+                          erGatewayId="$(ER_GATEWAY_ID)" \
+                          erCircuitResourceId="${{ parameters.erCircuitResourceId }}" \
+                          connectionName="${{ parameters.connectionName }}" \
+                          routingWeight=${{ parameters.routingWeight }} \
+                          logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                        --output json)
+
+                      echo "$OUTPUT" | tee er-connection-output.json
+
+                      CONN_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.erConnectionId.value // empty')
+
+                      echo "##[section]Deployment outputs:"
+                      echo "  ER Connection ID: $CONN_ID"
+
+                      echo "##vso[task.setvariable variable=connectionId;isOutput=true]$CONN_ID"
+
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish deployment output'
+                  condition: always()
+                  inputs:
+                    targetPath: er-connection-output.json
+                    artifactName: 'er-connection-output-$(Build.BuildNumber)'
+
+                - bash: |
+                    set -euo pipefail
+
+                    CONN_ID=$(cat er-connection-output.json | jq -r '.properties.outputs.erConnectionId.value // "N/A"')
+
+                    cat << SUMMARY
+                    ============================================================
+                    ExpressRoute Connection Created Successfully
+                    ============================================================
+                    Connection name : ${{ parameters.connectionName }}
+                    Connection ID   : $CONN_ID
+                    Circuit linked  : ${{ parameters.erCircuitResourceId }}
+                    Routing weight  : ${{ parameters.routingWeight }}
+                    ============================================================
+
+                    Verify connectivity (allow 5-15 minutes for BGP to establish):
+
+                    1. Azure Portal > ExpressRoute circuit > Connections
+                       Status should show: Connected
+
+                    2. Azure Portal > Virtual network gateway > BGP peers
+                       On-premises prefixes should appear in the routing table
+
+                    3. Ping test from on-premises host:
+                       ping <Azure VM IP in snet-management 10.0.2.x>
+
+                    4. Checkpoint routing verification:
+                       Verify on-premises traffic flows through Checkpoint NVA
+                       Check route table: snet-workload UDR points to Checkpoint
+
+                    Reference: docs/expressroute-setup.md
+                    ============================================================
+                    SUMMARY
+                  displayName: 'Post-deploy summary and connectivity verification steps'
