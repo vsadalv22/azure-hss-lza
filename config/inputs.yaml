@@ -74,17 +74,26 @@ network_settings:
     version: "latest"
     internal_ip: "10.0.1.4"           # Static — referenced in UDR
 
-  # ExpressRoute (replaces VPN Gateway — no Bastion)
+  # ExpressRoute
+  # NOTE: The circuit itself is created MANUALLY by the network team.
+  #       See docs/expressroute-setup.md for the full runbook.
+  #       Only the Gateway (Azure resource) is deployed by IaC.
   expressroute:
-    enabled: true
-    circuit_name: "erc-hub-australiaeast-001"
-    service_provider: ""             # e.g. Equinix, Megaport, Telstra
-    peering_location: "Sydney"       # ER peering location (not Azure region)
-    bandwidth_mbps: 1000             # 1 Gbps
-    sku_tier: "Standard"
-    sku_family: "UnlimitedData"
+    # ── Deployed by IaC (workflow 03) ──────────────────────────
     gateway_name: "ergw-hub-australiaeast-001"
     gateway_sku: "ErGw1AZ"           # Zone-redundant; ErGw2AZ for 10G
+
+    # ── Created MANUALLY (not in code) ─────────────────────────
+    # circuit_name: "erc-hub-australiaeast-001"
+    # service_provider: ""           # e.g. Equinix, Megaport, Telstra
+    # peering_location: "Sydney"     # ER peering location (NOT Azure region)
+    # bandwidth_mbps: 1000           # 1 Gbps — upgradeable without downtime
+    # sku_tier: "Standard"
+    # sku_family: "UnlimitedData"
+
+    # ── Deployed by IaC once circuit is provisioned (workflow 03b) ──
+    # connection_name: "con-ergw-to-circuit-001"
+    # routing_weight: 0
 
 # ---- Logging & Monitoring ----
 logging_settings:

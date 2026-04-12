@@ -265,9 +265,23 @@ param erPeeringLocation     = 'Sydney'
 ┌──────────────────────────────────────────────────────────┐
 │  Workflow 03 — Connectivity                              │
 │  Scope: Connectivity Subscription                        │
-│  Creates Hub VNet, Checkpoint NVA, ExpressRoute          │
-│  → Update secrets: HUB_VNET_ID, ROUTE_TABLE_ID           │
-│  → Provider must provision ER circuit (1-5 business days)│
+│  Creates Hub VNet, Checkpoint NVA, ER Gateway            │
+│  → Update secrets: HUB_VNET_ID, ROUTE_TABLE_ID,          │
+│                    ER_GATEWAY_ID                         │
+│                                                          │
+│  ⚠️  MANUAL STEP — Network team creates ER circuit       │
+│     in Azure Portal and sends service key to provider    │
+│     See: docs/expressroute-setup.md                      │
+│     Wait for ProviderState = Provisioned (1–5 days)      │
+│     Set secret: ER_CIRCUIT_RESOURCE_ID                   │
+└──────────────────────────┬───────────────────────────────┘
+                           ▼
+┌──────────────────────────────────────────────────────────┐
+│  Workflow 03b — ER Connection  (manual trigger only)     │
+│  Scope: Connectivity Subscription                        │
+│  Links ER Gateway to manually-created circuit            │
+│  Pre-flight check: verifies ProviderState = Provisioned  │
+│  → BGP routes established, on-prem connectivity live     │
 └──────────────────────────┬───────────────────────────────┘
                            ▼
 ┌──────────────────────────────────────────────────────────┐
@@ -287,32 +301,66 @@ param erPeeringLocation     = 'Sydney'
 
 ## ExpressRoute Configuration
 
-### Circuit Details
+> **Design decision:** The ExpressRoute **circuit** is created and maintained **manually** by the network team. It is not managed by IaC. This separates the commercial / provider relationship from the automated infrastructure pipeline.
+
+### What is Automated vs Manual
+
+| Resource | Managed by | Workflow |
+|---|---|---|
+| ER Gateway `ergw-hub-australiaeast-001` | **IaC (Bicep)** | `03-platform-connectivity` |
+| ER Circuit `erc-hub-australiaeast-001` | **Manual — network team** | See `docs/expressroute-setup.md` |
+| ER Connection `con-ergw-to-circuit-001` | **IaC (Bicep)** | `03b-platform-er-connection` |
+
+### End-to-End Provisioning Flow
+
+```
+  IaC (Workflow 03)              Manual — Network Team             IaC (Workflow 03b)
+  ─────────────────              ─────────────────────             ──────────────────
+  Deploy ER Gateway         →    Create ER circuit in Portal   →   Run workflow 03b
+  (ErGw1AZ, zone-redundant)      Send service key to provider       with circuit resource ID
+  Output: ER_GATEWAY_ID          Wait for ProviderState:            Pre-flight verifies
+                                  Provisioned (1–5 days)             ProviderState = Provisioned
+                                 Copy circuit resource ID            Deploys connection resource
+                                 Set ER_CIRCUIT_RESOURCE_ID          Gateway ↔ Circuit linked
+                                  GitHub secret                      BGP routes established
+```
+
+### Gateway Details
 
 | Parameter | Value |
 |---|---|
+| Gateway name | `ergw-hub-australiaeast-001` |
+| SKU | `ErGw1AZ` — zone-redundant across 3 AZs, up to 1 Gbps |
+| Gateway subnet | `GatewaySubnet` — `10.0.3.0/27` |
+| Public IP | `pip-ergw-hub-001` — Standard, Static, Zone-redundant |
+
+### Recommended Circuit Settings (Manual Creation)
+
+| Parameter | Recommended Value |
+|---|---|
 | Circuit name | `erc-hub-australiaeast-001` |
-| Peering location | Sydney |
-| Bandwidth | 1 Gbps (upgradeable without downtime) |
-| SKU tier | Standard |
-| SKU family | **UnlimitedData** |
-| Gateway | `ergw-hub-australiaeast-001` (ErGw1AZ — zone-redundant) |
-| Gateway subnet | `10.0.3.0/27` |
+| Region | `Australia East` |
+| Peering location | `Sydney` |
+| Bandwidth | `1 Gbps` (upgradeable online without downtime) |
+| SKU tier | `Standard` |
+| SKU family | `UnlimitedData` (avoids unpredictable egress costs) |
+| Resource group | `rg-connectivity-hub-australiaeast-001` |
 
-### Provisioning Flow
+### Full Manual Runbook
 
-```
-1. Bicep deploys ER circuit resource  →  State: NotProvisioned
-2. You send service key to provider   →  State: Provisioning
-3. Provider enables the circuit       →  State: Provisioned
-4. Bicep creates ER connection        →  State: Connected
-```
+See **[docs/expressroute-setup.md](docs/expressroute-setup.md)** for the complete step-by-step guide including:
+- Portal and CLI instructions for circuit creation
+- How to send the service key to your provider
+- How to verify provisioning status
+- How to trigger workflow `03b` to link the gateway
+- Troubleshooting and bandwidth upgrade guidance
 
-> **Important:** The ER connection resource (`con-ergw-to-circuit-001`) will not reach `Succeeded` until the provider has provisioned the circuit. This is expected behaviour.
+### New GitHub Secret Required After Manual Circuit Creation
 
-### Upgrading Bandwidth
-
-Bandwidth can be increased without downtime via the Azure Portal or by updating `erBandwidthInMbps` in the parameter file and re-running workflow 03.
+| Secret | Value |
+|---|---|
+| `ER_CIRCUIT_RESOURCE_ID` | Circuit resource ID (set after manual circuit creation) | `/subscriptions/.../expressRouteCircuits/erc-...` |
+| `ER_GATEWAY_ID` | ER Gateway resource ID | Set from workflow 03 output |
 
 ---
 
@@ -670,7 +718,8 @@ This landing zone is built to align with the following standards and frameworks:
 |---|---|---|---|
 | `01-platform-management-groups.yml` | Push to `main` (`platform/management-groups/**`) | Tenant | `platform-production` |
 | `02-platform-logging.yml` | Push to `main` (`platform/logging/**`) | Management Sub | `platform-production` |
-| `03-platform-connectivity.yml` | Push to `main` (`platform/connectivity/**`) | Connectivity Sub | `platform-production` |
+| `03-platform-connectivity.yml` | Push to `main` (`platform/connectivity/**`, excl. `er-connection.bicep`) | Connectivity Sub | `platform-production` |
+| `03b-platform-er-connection.yml` | **Manual trigger only** — run after provider provisions ER circuit | Connectivity Sub RG | `platform-production` |
 | `04-subscription-vending.yml` | Push to `main` (`subscription-vending/parameters/**`) | Root MG | `vending-network-review` → `vending-security-review` → `vending-platform-approval` |
 | `05-platform-sentinel.yml` | Push to `main` (`platform/sentinel/**`) | Management Sub | `platform-production` |
 | `06-platform-policies.yml` | Push to `main` (`platform/policies/**`) | Root MG | `platform-production` |

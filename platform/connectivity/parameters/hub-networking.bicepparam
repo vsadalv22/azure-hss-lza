@@ -2,42 +2,45 @@ using '../main.bicep'
 
 // ============================================================
 // Hub Networking Parameters — Australia East
-// ExpressRoute: Standard / UnlimitedData / 1 Gbps
-// Checkpoint  : CloudGuard (sg-byol)
-// No Bastion  : Access management VMs via ExpressRoute from on-prem
+//
+// What this deploys (IaC):
+//   • Hub VNet (10.0.0.0/16) with 4 subnets
+//   • ExpressRoute Gateway — ErGw1AZ (zone-redundant)
+//   • Checkpoint CloudGuard R81.10 NVA (dual NIC)
+//   • NSGs, Route Table (UDR → Checkpoint)
+//
+// What is NOT deployed by code:
+//   • ExpressRoute circuit — created manually (see docs/expressroute-setup.md)
+//   • ER connection        — created via workflow 03b after provider provisioning
 // ============================================================
 
 param location = 'australiaeast'
 
 param hubVnetAddressPrefix = '10.0.0.0/16'
 
-// Injected from GitHub Actions secret LOG_ANALYTICS_WORKSPACE_ID
+// Set via GitHub Actions secret: LOG_ANALYTICS_WORKSPACE_ID
 param logAnalyticsWorkspaceId = ''
 
 param checkpointAdminUsername = 'azureadmin'
-// Injected from GitHub Actions secret CHECKPOINT_ADMIN_PASSWORD
+// Set via GitHub Actions secret: CHECKPOINT_ADMIN_PASSWORD
 param checkpointAdminPassword = ''
 
 param checkpointVmSize = 'Standard_D3_v2'
 
-// sg-byol  = Bring Your Own Licence (requires Checkpoint licence)
-// sg-ngtp  = PAYG — Next Gen Threat Prevention
-// sg-ngtx  = PAYG — Next Gen Threat Extraction
+// sg-byol  = Bring Your Own Licence
+// sg-ngtp  = PAYG Next Gen Threat Prevention
+// sg-ngtx  = PAYG Next Gen Threat Extraction
 param checkpointSku = 'sg-byol'
 
-// ---- ExpressRoute Circuit ----
-param erCircuitName       = 'erc-hub-australiaeast-001'
-param erServiceProviderName = '<YOUR_ER_PROVIDER>'   // e.g. 'Equinix' or 'Megaport'
-param erPeeringLocation   = 'Sydney'                 // ER peering location (not Azure region)
-param erBandwidthInMbps   = 1000                     // 1 Gbps
-param erSkuTier           = 'Standard'
-param erSkuFamily         = 'UnlimitedData'
-param erGatewaySku        = 'ErGw1AZ'               // Zone-redundant; upgrade to ErGw2AZ for 10G
+// ErGw1AZ  = Zone-redundant, up to 1 Gbps  (default)
+// ErGw2AZ  = Zone-redundant, up to 2 Gbps
+// ErGw3AZ  = Zone-redundant, up to 10 Gbps
+param erGatewaySku = 'ErGw1AZ'
 
 param tags = {
-  environment : 'connectivity'
-  region      : 'australiaeast'
-  managedBy   : 'platform-team'
-  createdBy   : 'alz-bicep'
-  costCenter  : 'platform'
+  environment: 'connectivity'
+  region     : 'australiaeast'
+  managedBy  : 'platform-team'
+  createdBy  : 'alz-bicep'
+  costCenter : 'platform'
 }
