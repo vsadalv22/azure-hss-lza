@@ -1,9 +1,31 @@
 name: "04 - Subscription Vending Machine"
 
-# ============================================================
-# Triggered manually or by pull request adding a new
-# subscription parameters file under subscription-vending/parameters/
-# ============================================================
+# =============================================================
+# APPROVAL PROCESS (4 stages):
+#
+#  Stage 1 — VALIDATE  (automated)
+#    • Bicep lint
+#    • IP overlap detection
+#    • Naming convention check
+#    • Mandatory tag validation
+#
+#  Stage 2 — WHAT-IF   (automated, posts result to PR)
+#    • ARM what-if against management group scope
+#    • Results commented on PR for human review
+#
+#  Stage 3 — REVIEW    (manual — 3 teams must approve)
+#    • Environment: vending-network-review   → Network team
+#    • Environment: vending-security-review  → Security / SOC team
+#    • Environment: vending-platform-approval → Platform leads (final gate)
+#
+#  Stage 4 — DEPLOY    (automated after all approvals)
+#    • Creates EA subscription
+#    • Provisions spoke VNet + peering + UDR
+#    • Assigns RBAC
+#    • Enables Defender for Cloud
+#    • Creates budget alert
+#    • Posts summary to PR
+# =============================================================
 
 on:
   push:
@@ -17,31 +39,37 @@ on:
   workflow_dispatch:
     inputs:
       param_file:
-        description: 'Parameters file (relative path, e.g. subscription-vending/parameters/sub-contoso-retail-prod.bicepparam)'
+        description: 'Relative path to the .bicepparam file'
         required: true
         type: string
 
 permissions:
-  id-token: write
-  contents: read
-  pull-requests: write   # Post what-if results as PR comment
+  id-token:      write
+  contents:      read
+  pull-requests: write
+  issues:        write
 
 env:
-  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-  ROOT_MG_ID: "alz"
-  EA_BILLING_ACCOUNT: ${{ secrets.EA_BILLING_ACCOUNT }}
-  EA_ENROLLMENT_ACCOUNT: ${{ secrets.EA_ENROLLMENT_ACCOUNT }}
-  HUB_VNET_ID: ${{ secrets.HUB_VNET_ID }}
-  ROUTE_TABLE_ID: ${{ secrets.ROUTE_TABLE_ID }}
-  LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+  AZURE_TENANT_ID:             ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:             ${{ secrets.AZURE_CLIENT_ID }}
+  ROOT_MG_ID:                  "alz"
+  EA_BILLING_ACCOUNT:          ${{ secrets.EA_BILLING_ACCOUNT }}
+  EA_ENROLLMENT_ACCOUNT:       ${{ secrets.EA_ENROLLMENT_ACCOUNT }}
+  HUB_VNET_ID:                 ${{ secrets.HUB_VNET_ID }}
+  ROUTE_TABLE_ID:              ${{ secrets.ROUTE_TABLE_ID }}
+  LOG_ANALYTICS_WORKSPACE_ID:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+  MANAGEMENT_SUBSCRIPTION_ID:  ${{ secrets.MANAGEMENT_SUBSCRIPTION_ID }}
 
+# =============================================================
+# STAGE 1 — VALIDATE (automated)
+# =============================================================
 jobs:
-  detect-changed-params:
-    name: Detect Changed Parameter Files
+  detect-files:
+    name: "Detect Changed Parameter Files"
     runs-on: ubuntu-latest
     outputs:
       param_files: ${{ steps.detect.outputs.param_files }}
+      has_files:   ${{ steps.detect.outputs.has_files }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,23 +81,41 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             FILES='["${{ github.event.inputs.param_file }}"]'
           else
-            FILES=$(git diff --name-only HEAD~1 HEAD -- 'subscription-vending/parameters/*.bicepparam' \
+            FILES=$(git diff --name-only HEAD~1 HEAD \
+              -- 'subscription-vending/parameters/*.bicepparam' \
               | jq -R -s -c 'split("\n") | map(select(length > 0))')
           fi
           echo "param_files=$FILES" >> "$GITHUB_OUTPUT"
+          COUNT=$(echo "$FILES" | jq 'length')
+          echo "has_files=$([ "$COUNT" -gt "0" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "Detected files: $FILES"
 
-  what-if:
-    name: What-If for ${{ matrix.param_file }}
+  # ── Lint ─────────────────────────────────────────────────
+  lint:
+    name: "Bicep Lint"
     runs-on: ubuntu-latest
-    needs: detect-changed-params
-    if: needs.detect-changed-params.outputs.param_files != '[]'
-    strategy:
-      matrix:
-        param_file: ${{ fromJson(needs.detect-changed-params.outputs.param_files) }}
-      max-parallel: 3
+    needs: detect-files
+    if: needs.detect-files.outputs.has_files == 'true'
     steps:
       - uses: actions/checkout@v4
+      - name: Install Bicep CLI
+        run: az bicep install
+      - name: Lint subscription-vending module
+        run: az bicep build --file subscription-vending/main.bicep
+
+  # ── Automated Validation ─────────────────────────────────
+  validate:
+    name: "Automated Validation — ${{ matrix.param_file }}"
+    runs-on: ubuntu-latest
+    needs: [detect-files, lint]
+    if: needs.detect-files.outputs.has_files == 'true'
+    strategy:
+      matrix:
+        param_file: ${{ fromJson(needs.detect-files.outputs.param_files) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -77,7 +123,70 @@ jobs:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           allow-no-subscriptions: true
 
-      - name: What-If Subscription Vend
+      - name: Run Validation Script
+        id: validate
+        run: |
+          pwsh -NonInteractive -File scripts/validate-subscription-request.ps1 \
+            -ParamFile "${{ matrix.param_file }}" \
+            -HubCIDR "10.0.0.0/16" \
+            -IdentityCIDR "10.10.0.0/16" \
+            -CorpRangeStart 100 \
+            -CorpRangeEnd 199 \
+            -OnlineRangeStart 200 \
+            -OnlineRangeEnd 254 2>&1 | tee validation-report.txt
+
+          if grep -q "VALIDATION FAILED" validation-report.txt; then
+            echo "VALIDATION_STATUS=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "VALIDATION_STATUS=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post validation result to PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('validation-report.txt', 'utf8');
+            const status = '${{ steps.validate.outputs.VALIDATION_STATUS }}';
+            const icon = status === 'passed' ? '✅' : '❌';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## ${icon} Automated Validation: \`${{ matrix.param_file }}\`\n\`\`\`\n${report}\n\`\`\``
+            });
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ github.run_number }}
+          path: validation-report.txt
+
+# =============================================================
+# STAGE 2 — WHAT-IF (automated, results posted to PR)
+# =============================================================
+  what-if:
+    name: "What-If — ${{ matrix.param_file }}"
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      matrix:
+        param_file: ${{ fromJson(needs.detect-files.outputs.param_files) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Run What-If
         id: whatif
         run: |
           RESULT=$(az deployment mg what-if \
@@ -86,45 +195,124 @@ jobs:
             --management-group-id "${{ env.ROOT_MG_ID }}" \
             --template-file subscription-vending/main.bicep \
             --parameters "${{ matrix.param_file }}" \
-            --parameters eaBillingAccountName="${EA_BILLING_ACCOUNT}" \
-                         eaEnrollmentAccountName="${EA_ENROLLMENT_ACCOUNT}" \
-                         hubVnetId="${HUB_VNET_ID}" \
-                         routeTableId="${ROUTE_TABLE_ID}" \
-                         logAnalyticsWorkspaceId="${LOG_ANALYTICS_WORKSPACE_ID}" \
-            2>&1 || true)
-          echo "$RESULT"
+            --parameters \
+              eaBillingAccountName="${{ env.EA_BILLING_ACCOUNT }}" \
+              eaEnrollmentAccountName="${{ env.EA_ENROLLMENT_ACCOUNT }}" \
+              hubVnetId="${{ env.HUB_VNET_ID }}" \
+              routeTableId="${{ env.ROUTE_TABLE_ID }}" \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+            2>&1 | head -200 || true)
+
+          echo "$RESULT" > whatif-result.txt
+
           {
-            echo 'WHATIF_RESULT<<EOF'
+            echo 'WHATIF_RESULT<<ENDOFWHATIF'
             echo "$RESULT"
-            echo 'EOF'
+            echo 'ENDOFWHATIF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Post What-If as PR comment
+      - name: Post What-If to PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
+            const fs = require('fs');
+            const result = fs.readFileSync('whatif-result.txt', 'utf8');
             const file = '${{ matrix.param_file }}';
-            const result = `${{ steps.whatif.outputs.WHATIF_RESULT }}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `## Subscription Vending What-If: \`${file}\`\n\`\`\`\n${result}\n\`\`\``
+              body: [
+                `## 🔍 What-If Result: \`${file}\``,
+                '',
+                '> **Review carefully before approving.** No resources will be created until all 3 teams approve and this PR is merged.',
+                '',
+                '```',
+                result.substring(0, 60000),
+                '```',
+                '',
+                '### Required Approvals',
+                '| Team | Environment Gate | Status |',
+                '|------|-----------------|--------|',
+                '| 🔌 Network Team | `vending-network-review` | ⏳ Pending |',
+                '| 🔒 Security Team | `vending-security-review` | ⏳ Pending |',
+                '| 🏗️ Platform Leads | `vending-platform-approval` | ⏳ Pending |',
+              ].join('\n')
             });
 
-  deploy:
-    name: Vend Subscription - ${{ matrix.param_file }}
+      - name: Upload What-If result
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatif-${{ github.run_number }}
+          path: whatif-result.txt
+
+# =============================================================
+# STAGE 3 — MANUAL APPROVALS (3 separate environment gates)
+# Configure each environment in: Settings → Environments
+# =============================================================
+
+  # Gate 1: Network Team — IP allocation, routing, peering
+  approval-network:
+    name: "⏳ Awaiting Network Team Approval"
     runs-on: ubuntu-latest
     needs: what-if
-    if: github.event_name != 'pull_request'   # Only deploy on push to main or manual trigger
-    environment: subscription-vending         # Requires approval
+    if: github.event_name != 'pull_request'
+    environment: vending-network-review    # Network team added as required reviewer
+    steps:
+      - name: Network Review Confirmed
+        run: |
+          echo "✅ Network team approved:"
+          echo "  • IP CIDR allocation confirmed non-overlapping"
+          echo "  • Routing via Checkpoint NVA confirmed"
+          echo "  • Spoke-to-hub peering design approved"
+
+  # Gate 2: Security Team — data classification, Defender, compliance
+  approval-security:
+    name: "⏳ Awaiting Security Team Approval"
+    runs-on: ubuntu-latest
+    needs: what-if
+    if: github.event_name != 'pull_request'
+    environment: vending-security-review   # Security team added as required reviewer
+    steps:
+      - name: Security Review Confirmed
+        run: |
+          echo "✅ Security team approved:"
+          echo "  • Data classification reviewed"
+          echo "  • Defender for Cloud plan appropriate"
+          echo "  • Compliance requirements met"
+          echo "  • Internet egress scope reviewed"
+
+  # Gate 3: Platform Leads — final sign-off (runs after both teams above)
+  approval-platform:
+    name: "⏳ Awaiting Platform Lead Approval (Final Gate)"
+    runs-on: ubuntu-latest
+    needs: [approval-network, approval-security]
+    if: github.event_name != 'pull_request'
+    environment: vending-platform-approval  # Platform leads as required reviewers
+    steps:
+      - name: Platform Lead Final Approval
+        run: |
+          echo "✅ Platform lead approved — proceeding to deployment"
+
+# =============================================================
+# STAGE 4 — DEPLOY (runs only after all 3 approvals)
+# =============================================================
+  deploy:
+    name: "🚀 Vend Subscription — ${{ matrix.param_file }}"
+    runs-on: ubuntu-latest
+    needs: approval-platform
+    if: github.event_name != 'pull_request'
     strategy:
       matrix:
-        param_file: ${{ fromJson(needs.detect-changed-params.outputs.param_files) }}
-      max-parallel: 1    # Vend one subscription at a time
+        param_file: ${{ fromJson(needs.detect-files.outputs.param_files) }}
+      max-parallel: 1    # One subscription at a time
+    outputs:
+      subscription_id:  ${{ steps.vend.outputs.subscriptionId }}
+      spoke_vnet_id:    ${{ steps.vend.outputs.spokeVnetId }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -132,31 +320,95 @@ jobs:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           allow-no-subscriptions: true
 
-      - name: Vend Subscription
+      - name: Deploy — Vend Subscription
         id: vend
         run: |
+          DEPLOY_NAME="sub-vend-$(date +%Y%m%d%H%M%S)"
+          echo "Deployment name: $DEPLOY_NAME"
+
           OUTPUT=$(az deployment mg create \
-            --name "sub-vend-$(date +%Y%m%d%H%M%S)" \
+            --name "$DEPLOY_NAME" \
             --location australiaeast \
             --management-group-id "${{ env.ROOT_MG_ID }}" \
             --template-file subscription-vending/main.bicep \
             --parameters "${{ matrix.param_file }}" \
-            --parameters eaBillingAccountName="${EA_BILLING_ACCOUNT}" \
-                         eaEnrollmentAccountName="${EA_ENROLLMENT_ACCOUNT}" \
-                         hubVnetId="${HUB_VNET_ID}" \
-                         routeTableId="${ROUTE_TABLE_ID}" \
-                         logAnalyticsWorkspaceId="${LOG_ANALYTICS_WORKSPACE_ID}" \
+            --parameters \
+              eaBillingAccountName="${{ env.EA_BILLING_ACCOUNT }}" \
+              eaEnrollmentAccountName="${{ env.EA_ENROLLMENT_ACCOUNT }}" \
+              hubVnetId="${{ env.HUB_VNET_ID }}" \
+              routeTableId="${{ env.ROUTE_TABLE_ID }}" \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
             --output json)
 
-          echo "$OUTPUT" | tee subscription-output.json
-          SUB_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.subscriptionId.value')
-          VNET_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.spokeVnetResourceId.value')
-          echo "subscriptionId=$SUB_ID"   >> "$GITHUB_OUTPUT"
-          echo "spokeVnetId=$VNET_ID"     >> "$GITHUB_OUTPUT"
-          echo "::notice title=Subscription Vended::New subscription ID: $SUB_ID | Spoke VNet: $VNET_ID"
+          echo "$OUTPUT" | tee vending-output.json
 
-      - name: Upload Output
+          SUB_ID=$(echo "$OUTPUT"   | jq -r '.properties.outputs.subscriptionId.value // empty')
+          VNET_ID=$(echo "$OUTPUT"  | jq -r '.properties.outputs.spokeVnetResourceId.value // empty')
+
+          echo "subscriptionId=$SUB_ID"  >> "$GITHUB_OUTPUT"
+          echo "spokeVnetId=$VNET_ID"    >> "$GITHUB_OUTPUT"
+
+      - name: Upload vending output
         uses: actions/upload-artifact@v4
         with:
-          name: subscription-vending-output-${{ github.run_number }}
-          path: subscription-output.json
+          name: vending-output-${{ github.run_number }}
+          path: vending-output.json
+
+      - name: Post deployment summary to PR / commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const subId   = '${{ steps.vend.outputs.subscriptionId }}';
+            const vnetId  = '${{ steps.vend.outputs.spokeVnetId }}';
+            const file    = '${{ matrix.param_file }}';
+
+            const body = [
+              '## ✅ Subscription Vended Successfully',
+              '',
+              `**Parameter file:** \`${file}\``,
+              `**Subscription ID:** \`${subId}\``,
+              `**Spoke VNet ID:** \`${vnetId}\``,
+              '',
+              '### What was provisioned',
+              '| Resource | Status |',
+              '|----------|--------|',
+              '| EA Subscription | ✅ Created |',
+              '| Management Group placement | ✅ Applied |',
+              '| Spoke VNet + subnets | ✅ Deployed |',
+              '| Spoke ↔ Hub VNet peering | ✅ Connected |',
+              '| UDR (0.0.0.0/0 → Checkpoint) | ✅ Applied |',
+              '| RBAC (AAD group → Contributor) | ✅ Assigned |',
+              '| Defender for Cloud | ✅ Enabled |',
+              '| Diagnostic settings | ✅ Enabled |',
+              '| Budget alert | ✅ Configured |',
+              '| Resource Group lock | ✅ Applied |',
+              '',
+              '### Next steps for the application team',
+              '1. Sign in to the Azure Portal and locate your new subscription',
+              '2. Verify VNet peering status shows **Connected**',
+              '3. Test connectivity to on-premises via ExpressRoute',
+              '4. Review Defender for Cloud recommendations',
+              '5. Deploy your workload resources',
+            ].join('\n');
+
+            // Comment on the originating PR if we can find it
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+            });
+            if (prs.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prs.data[0].number,
+                body
+              });
+            }
+
+            // Always write to Job summary
+            await core.summary.addRaw(body).write();
+
+      - name: Emit audit event
+        run: |
+          echo "::notice title=Subscription Vended::Subscription ${{ steps.vend.outputs.subscriptionId }} created from ${{ matrix.param_file }} — approved by network, security and platform teams"

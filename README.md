@@ -19,11 +19,13 @@
 8. [Checkpoint CloudGuard NVA](#checkpoint-cloudguard-nva)
 9. [Microsoft Sentinel](#microsoft-sentinel)
 10. [Subscription Vending Machine](#subscription-vending-machine)
-11. [GitHub Actions Workflows](#github-actions-workflows)
-12. [Branch Strategy](#branch-strategy)
-13. [GitHub Secrets Reference](#github-secrets-reference)
-14. [Networking Reference](#networking-reference)
-15. [Post-Deployment Checklist](#post-deployment-checklist)
+11. [Subscription Vending — Approval Process](#subscription-vending--approval-process)
+12. [Industry Best Practices Applied](#industry-best-practices-applied)
+13. [GitHub Actions Workflows](#github-actions-workflows)
+14. [Branch Strategy](#branch-strategy)
+15. [GitHub Secrets Reference](#github-secrets-reference)
+16. [Networking Reference](#networking-reference)
+17. [Post-Deployment Checklist](#post-deployment-checklist)
 
 ---
 
@@ -448,6 +450,220 @@ Then open a Pull Request — the what-if output will be posted as a comment auto
 
 ---
 
+---
+
+## Subscription Vending — Approval Process
+
+Every new subscription vending request goes through a **4-stage gate process** before any Azure resources are created.
+
+### Stage Overview
+
+```
+  REQUESTOR                 AUTOMATED                  HUMAN REVIEW               DEPLOY
+      │                         │                           │                        │
+      │  1. Raise GitHub Issue  │                           │                        │
+      │  (subscription-request  │                           │                        │
+      │   issue template)       │                           │                        │
+      ├────────────────────────►│                           │                        │
+      │                         │  2. Platform team creates │                        │
+      │                         │     .bicepparam file,     │                        │
+      │                         │     opens Pull Request    │                        │
+      │                         ├──────────────────────────►│                        │
+      │                         │                           │                        │
+      │                         │  Stage 1: VALIDATE (auto) │                        │
+      │                         │  • Bicep lint             │                        │
+      │                         │  • IP overlap check       │                        │
+      │                         │  • Naming convention      │                        │
+      │                         │  • Mandatory tags         │                        │
+      │                         │                           │                        │
+      │                         │  Stage 2: WHAT-IF (auto)  │                        │
+      │                         │  • ARM what-if posted     │                        │
+      │                         │    as PR comment          │                        │
+      │                         │                           │                        │
+      │                         │                           │  Stage 3: REVIEW       │
+      │                         │                           │  (3 teams in parallel) │
+      │                         │                           │  🔌 Network team       │
+      │                         │                           │  🔒 Security team      │
+      │                         │                           │  🏗️ Platform leads     │
+      │                         │                           │  (all 3 must approve)  │
+      │                         │                           │                        │
+      │                         │                           │         Stage 4: DEPLOY│
+      │                         │                           │  • EA subscription     │
+      │                         │                           │  • Spoke VNet + peering│
+      │                         │                           │  • UDR via Checkpoint  │
+      │                         │                           │  • RBAC assignment     │
+      │                         │                           │  • Defender for Cloud  │
+      │                         │                           │  • Budget alerts       │
+      │◄────────────────────────────────────────────────────────────────────────────┤
+      │  Notified via PR comment with subscription ID and next steps                │
+```
+
+### Step-by-Step Guide for Requesting a New Subscription
+
+#### Step 1 — Raise a GitHub Issue
+
+Navigate to **Issues → New Issue → "🆕 New Subscription Request"** and complete the form. Fields include:
+- Application name, display name, environment
+- Target management group (corp / online / sandbox)
+- Business unit and cost centre
+- Owner email and Azure AD group Object ID
+- Requested spoke CIDR (must be from the allocated range)
+- Required subnets with CIDR and purpose
+- Internet egress requirements
+- Data classification
+- Applicable compliance frameworks (APRA CPS 234, ISM, Essential Eight, PCI-DSS)
+- Microsoft Defender plan selection
+- Monthly budget estimate
+
+#### Step 2 — Platform Team Creates the Parameter File
+
+After reviewing the Issue, a platform team member runs:
+
+```powershell
+./scripts/new-subscription.ps1 `
+    -SubscriptionAlias   "sub-myapp-prod" `
+    -DisplayName         "MyApp Production — Payments" `
+    -TargetMG            "alz-landingzones-corp" `
+    -SpokeAddressPrefix  "10.101.0.0/16" `
+    -OwnerEmail          "team@company.com.au" `
+    -OwnerGroupObjectId  "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+Then reviews and completes the generated `.bicepparam` file (setting budget, Defender plans, compliance tags), and opens a Pull Request referencing the original Issue.
+
+#### Step 3 — Automated Validation (Stage 1 & 2)
+
+On PR creation, GitHub Actions automatically:
+
+| Check | What it validates |
+|---|---|
+| **Bicep lint** | Template syntax and best-practice rules |
+| **Naming convention** | `sub-<app>-<env>` lowercase format |
+| **IP overlap detection** | Spoke CIDR vs hub, identity, and all existing spokes |
+| **CIDR range alignment** | Corp spokes: 10.100-199.x.x / Online spokes: 10.200-254.x.x |
+| **Mandatory tags** | `environment`, `ownerEmail`, `dataClassification`, `costCenter` |
+| **Owner fields** | Valid email + GUID format for AAD group |
+| **Budget** | `budgetAmountAUD` is set |
+| **ARM What-If** | Full deployment preview posted as PR comment |
+
+All results are posted as comments on the PR. If any automated check fails, the PR is blocked until resolved.
+
+#### Step 4 — Three-Team Human Review (Stage 3)
+
+All three approvals must be granted — they run in **parallel** to minimise wait time:
+
+| Team | GitHub Environment | Reviews |
+|---|---|---|
+| 🔌 **Network Team** | `vending-network-review` | IP allocation confirmed, routing via Checkpoint, peering design |
+| 🔒 **Security Team** | `vending-security-review` | Data classification, Defender plan, compliance scope, internet egress |
+| 🏗️ **Platform Leads** | `vending-platform-approval` | Final architecture sign-off (runs after both teams above) |
+
+Each reviewer clicks **"Review deployments"** in the Actions tab of their assigned environment gate.
+
+#### Step 5 — Automated Deployment (Stage 4)
+
+After all three approvals, the pipeline automatically:
+
+1. Creates the EA subscription and places it in the correct MG
+2. Provisions the spoke VNet with all subnets
+3. Peers the spoke to the hub (traffic routes via Checkpoint NVA)
+4. Assigns RBAC to the AAD group
+5. Enables the selected Defender for Cloud plans
+6. Creates budget alerts at 80%, 100%, and 120% of monthly budget
+7. Configures subscription-level diagnostic settings → central Log Analytics
+8. Posts a success summary comment on the originating PR
+
+### Setting Up the Approval Environments
+
+Configure in **Settings → Environments**:
+
+| Environment | Required Reviewers | Notes |
+|---|---|---|
+| `vending-network-review` | Network team GitHub accounts / team | Parallel with security |
+| `vending-security-review` | Security team GitHub accounts / team | Parallel with network |
+| `vending-platform-approval` | Platform lead accounts | Runs after both above |
+| `platform-production` | Platform leads | Used by platform workflows 01–03, 05–07 |
+
+---
+
+## Industry Best Practices Applied
+
+This landing zone is built to align with the following standards and frameworks:
+
+### Security
+
+| Practice | Implementation |
+|---|---|
+| **Zero internet exposure for management** | No Bastion, no public IPs on VMs — access via ExpressRoute from on-prem |
+| **All egress via NVA** | UDR `0.0.0.0/0 → Checkpoint 10.0.1.4` applied to every spoke subnet |
+| **No public IPs on VMs** | Azure Policy `DENY — Public IP addresses on virtual machines` |
+| **No RDP / SSH from internet** | Azure Policy enforced on all NSGs |
+| **HTTPS only** | Azure Policy denies HTTP on storage accounts |
+| **Key Vault protection** | Policy requires soft delete + purge protection |
+| **Microsoft Defender** | Auto-deployed to every vended subscription via policy + vending module |
+| **SIEM** | Microsoft Sentinel with 8 connectors, UEBA, and 5 analytics rules |
+| **OIDC authentication** | No client secrets stored anywhere — federated credentials only |
+
+### Governance
+
+| Practice | Implementation |
+|---|---|
+| **Management group hierarchy** | 5-level ALZ hierarchy — Corp, Online, Sandbox, Decommissioned |
+| **Azure Policy** | 15 built-in policy assignments at root MG — deny, audit, and DINE effects |
+| **Mandatory tagging** | Policy enforced: `environment`, `managedBy`, `costCenter`, `createdBy` |
+| **Resource locks** | Network RG locked in every vended subscription |
+| **Allowed regions** | Policy restricts deployments to `australiaeast` + `australiasoutheast` only |
+| **No classic admins** | Policy audits and flags legacy RBAC administrators |
+| **No custom owner roles** | Policy denies custom subscription owner role definitions |
+| **Budget alerts** | 80% forecast, 100% actual, 120% actual alerts on every subscription |
+
+### Networking
+
+| Practice | Implementation |
+|---|---|
+| **Hub & Spoke** | Centralised connectivity subscription, all spokes peer to hub |
+| **Private DNS** | 28 private DNS zones in hub, linked to hub VNet, spokes resolve via peering |
+| **ExpressRoute** | Standard / UnlimitedData / 1 Gbps — no VPN, no internet crossing |
+| **Zone-redundant gateway** | `ErGw1AZ` across all 3 availability zones in Australia East |
+| **NSG on all subnets** | Checkpoint external and internal subnets have NSGs with least-privilege rules |
+| **Network Watcher** | Deployed per subscription for flow log analysis |
+
+### Observability
+
+| Practice | Implementation |
+|---|---|
+| **Centralised logging** | All resources send diagnostics to central Log Analytics workspace |
+| **Activity logs** | Subscription activity log streamed to LAW on every vended subscription |
+| **Platform alerts** | Action groups for ops team + SOC; alerts on policy delete, MG change, Service Health |
+| **Sentinel analytics** | 5 scheduled analytics rules with entity mapping and MITRE ATT&CK tagging |
+| **Platform workbook** | Azure Monitor workbook for hub network + Sentinel health |
+
+### CI/CD and IaC
+
+| Practice | Implementation |
+|---|---|
+| **Infrastructure as Code** | 100% Bicep — no manual portal changes |
+| **Azure Verified Modules** | All resources use AVM modules from `mcr.microsoft.com/bicep` |
+| **What-if before deploy** | Every workflow runs ARM what-if and requires review before deploy |
+| **Approval gates** | GitHub Environments with required reviewers on all production workflows |
+| **CODEOWNERS** | Automatic reviewer assignment per path — security team owns sentinel, network team owns connectivity |
+| **PR template** | Structured checklist ensures consistent review for all change types |
+| **Issue template** | Structured subscription request form captures all required information upfront |
+| **Validation script** | Automated IP overlap and naming checks block invalid requests before human review |
+| **Secrets management** | All sensitive values in GitHub secrets — never in code |
+| **Branch protection** | `main`, `staging`, `prod` branches require PRs and status checks |
+
+### Compliance Alignment
+
+| Framework | Coverage |
+|---|---|
+| **APRA CPS 234** | Encryption, access control, logging, incident response (Sentinel), third-party access controls |
+| **Australian ISM** | Asset classification via tags, network segmentation, multi-factor authentication (AAD), audit logging |
+| **Essential Eight** | Application control readiness (Defender), patch management (Update Manager via policy), MFA, restrict admin privileges |
+| **ISO 27001** | Asset management (tags), access control (RBAC + policy), logging (LAW + Sentinel), continuity (ER zone-redundant) |
+
+---
+
 ## GitHub Actions Workflows
 
 | Workflow | Trigger | Scope | Environment Gate |
@@ -455,8 +671,10 @@ Then open a Pull Request — the what-if output will be posted as a comment auto
 | `01-platform-management-groups.yml` | Push to `main` (`platform/management-groups/**`) | Tenant | `platform-production` |
 | `02-platform-logging.yml` | Push to `main` (`platform/logging/**`) | Management Sub | `platform-production` |
 | `03-platform-connectivity.yml` | Push to `main` (`platform/connectivity/**`) | Connectivity Sub | `platform-production` |
-| `04-subscription-vending.yml` | Push to `main` (`subscription-vending/parameters/**`) | Root MG | `subscription-vending` |
+| `04-subscription-vending.yml` | Push to `main` (`subscription-vending/parameters/**`) | Root MG | `vending-network-review` → `vending-security-review` → `vending-platform-approval` |
 | `05-platform-sentinel.yml` | Push to `main` (`platform/sentinel/**`) | Management Sub | `platform-production` |
+| `06-platform-policies.yml` | Push to `main` (`platform/policies/**`) | Root MG | `platform-production` |
+| `07-platform-monitoring.yml` | Push to `main` (`platform/monitoring/**`) | Management Sub | `platform-production` |
 
 All workflows use:
 - **OIDC authentication** — no stored client secrets
@@ -513,10 +731,13 @@ feature/my-change ──► dev ──► staging ──► main
 | `EA_BILLING_ACCOUNT` | EA billing account number | `12345678` |
 | `EA_ENROLLMENT_ACCOUNT` | EA enrollment account number | `987654` |
 | `CHECKPOINT_ADMIN_PASSWORD` | Checkpoint VM password | _(strong password)_ |
-| `SENTINEL_SECURITY_CONTACT` | SOC alert email | `soc@company.com` |
+| `SENTINEL_SECURITY_CONTACT` | SOC alert email | `soc@company.com.au` |
 | `LOG_ANALYTICS_WORKSPACE_ID` | LAW resource ID | `/subscriptions/.../workspaces/law-...` |
 | `HUB_VNET_ID` | Hub VNet resource ID | `/subscriptions/.../virtualNetworks/vnet-hub-...` |
 | `ROUTE_TABLE_ID` | UDR resource ID | `/subscriptions/.../routeTables/udr-...` |
+| `OPS_ALERT_EMAIL` | Platform ops team email | `platform-ops@company.com.au` |
+| `ER_CIRCUIT_RESOURCE_ID` | ExpressRoute circuit resource ID | `/subscriptions/.../expressRouteCircuits/erc-...` |
+| `CHECKPOINT_VM_RESOURCE_ID` | Checkpoint VM resource ID | `/subscriptions/.../virtualMachines/vm-checkpoint-...` |
 
 ---
 

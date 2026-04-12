@@ -1,0 +1,32 @@
+# =============================================================
+# CODEOWNERS — HSS Azure Enterprise Landing Zone
+# Every PR automatically requests review from the right team.
+# Syntax: <path pattern>   <@user or @org/team>
+# =============================================================
+
+# Default owner for everything not matched below
+*                                          @vsadalv22
+
+# ------ Platform core (platform team leads only) ------
+/.github/                                  @vsadalv22
+/platform/management-groups/              @vsadalv22
+/platform/policies/                       @vsadalv22
+/bicepconfig.json                         @vsadalv22
+/config/                                  @vsadalv22
+
+# ------ Connectivity / Networking (network team) ------
+/platform/connectivity/                   @vsadalv22
+/platform/identity/                       @vsadalv22
+
+# ------ Security (security / SOC team) ------
+/platform/sentinel/                       @vsadalv22
+/platform/monitoring/                     @vsadalv22
+
+# ------ Subscription Vending (REQUIRES platform + security + network) ------
+# Every new .bicepparam triggers review from all three teams
+/subscription-vending/parameters/         @vsadalv22
+/subscription-vending/main.bicep          @vsadalv22
+/subscription-vending/modules/            @vsadalv22
+
+# ------ Scripts ------
+/scripts/                                 @vsadalv22

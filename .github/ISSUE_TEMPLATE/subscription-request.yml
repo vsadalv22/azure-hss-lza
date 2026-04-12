@@ -1,0 +1,220 @@
+name: "🆕 New Subscription Request"
+description: "Request a new Azure landing zone subscription via the vending machine."
+title: "[SUB-REQUEST] <application-name> — <environment>"
+labels: ["subscription-vending", "needs-review"]
+assignees: []
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## New Subscription Request
+        Complete all fields below. Once submitted:
+        1. Platform team validates the request within **2 business days**
+        2. Security team reviews networking and access design
+        3. Network team confirms IP address allocation
+        4. On approval, platform team creates the `.bicepparam` file and raises a PR
+        5. After PR approval and merge, the subscription is automatically vended
+
+  # ── Application Details ──────────────────────────────────
+  - type: input
+    id: app_name
+    attributes:
+      label: Application Name
+      description: Short name used in resource naming (lowercase, no spaces)
+      placeholder: "myapp"
+    validations:
+      required: true
+
+  - type: input
+    id: display_name
+    attributes:
+      label: Subscription Display Name
+      description: Full descriptive name shown in Azure Portal
+      placeholder: "MyApp Production — Payments"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment
+      options:
+        - Production
+        - Non-Production (UAT / Staging)
+        - Development
+        - Sandbox
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target_mg
+    attributes:
+      label: Target Management Group
+      description: Where should this subscription be placed in the MG hierarchy?
+      options:
+        - "alz-landingzones-corp (Internal / private workloads)"
+        - "alz-landingzones-online (Internet-facing workloads)"
+        - "alz-sandbox (Experimental / sandbox)"
+    validations:
+      required: true
+
+  # ── Business & Ownership ────────────────────────────────
+  - type: input
+    id: business_unit
+    attributes:
+      label: Business Unit / Cost Centre
+      placeholder: "Finance / CC-1234"
+    validations:
+      required: true
+
+  - type: input
+    id: owner_email
+    attributes:
+      label: Application Owner Email
+      placeholder: "team@company.com.au"
+    validations:
+      required: true
+
+  - type: input
+    id: owner_aad_group
+    attributes:
+      label: Azure AD Group Object ID (for RBAC)
+      description: The AAD group that will receive Contributor access to the subscription
+      placeholder: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    validations:
+      required: true
+
+  - type: input
+    id: monthly_budget
+    attributes:
+      label: Estimated Monthly Azure Spend (AUD)
+      placeholder: "$5,000"
+    validations:
+      required: true
+
+  # ── Networking ───────────────────────────────────────────
+  - type: input
+    id: spoke_cidr
+    attributes:
+      label: Requested Spoke VNet CIDR
+      description: |
+        Must be a /16 from the corp range (10.100-10.199.0.0/16) or online range (10.200-10.254.0.0/16).
+        Confirm with network team that this range is not already allocated.
+      placeholder: "10.101.0.0/16"
+    validations:
+      required: true
+
+  - type: textarea
+    id: subnets
+    attributes:
+      label: Required Subnets
+      description: List the subnets needed with CIDR and purpose
+      placeholder: |
+        snet-app  10.101.0.0/24  Application tier
+        snet-data 10.101.1.0/24  Database tier
+        snet-web  10.101.2.0/24  Web / DMZ tier
+    validations:
+      required: true
+
+  - type: dropdown
+    id: internet_egress
+    attributes:
+      label: Internet Egress Required?
+      description: All egress will traverse Checkpoint NVA in hub — confirm access policy scope
+      options:
+        - "No — internal only (on-prem via ExpressRoute + Azure only)"
+        - "Yes — specific destinations (provide URLs in justification)"
+        - "Yes — general internet access (requires security team sign-off)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: on_prem_connectivity
+    attributes:
+      label: On-Premises Connectivity Required?
+      options:
+        - "Yes — via ExpressRoute through hub"
+        - "No — Azure-only workload"
+    validations:
+      required: true
+
+  # ── Security & Compliance ────────────────────────────────
+  - type: dropdown
+    id: data_classification
+    attributes:
+      label: Highest Data Classification
+      options:
+        - "PUBLIC"
+        - "INTERNAL"
+        - "CONFIDENTIAL"
+        - "HIGHLY CONFIDENTIAL / RESTRICTED"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: Applicable Compliance Frameworks
+      options:
+        - label: "APRA CPS 234 (Information Security)"
+        - label: "ISM (Australian Government ISM)"
+        - label: "Essential Eight"
+        - label: "PCI-DSS"
+        - label: "SOC 2"
+        - label: "ISO 27001"
+
+  - type: dropdown
+    id: defender_plan
+    attributes:
+      label: Microsoft Defender for Cloud Plan
+      description: Select the Defender plans required for this workload
+      options:
+        - "Foundational CSPM (free)"
+        - "Defender CSPM + Servers Plan 1"
+        - "Defender CSPM + Servers Plan 2 (EDR)"
+        - "Full Defender suite (Servers P2 + Databases + Storage + Containers)"
+    validations:
+      required: true
+
+  # ── Justification & Additional Context ──────────────────
+  - type: textarea
+    id: justification
+    attributes:
+      label: Business Justification
+      description: Why is a new subscription needed? (existing subscription cannot be reused?)
+      placeholder: "This application requires network isolation due to..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context / Special Requirements
+      description: Anything else the platform / security / network team should know
+      placeholder: "Requires private endpoint to Azure SQL, needs 3rd-party SaaS connectivity to..."
+
+  # ── Approvals Checklist (filled by reviewer, not requestor) ──
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        ## For Reviewer Use Only
+        _The following is completed during the review process — not by the requestor._
+
+  - type: checkboxes
+    id: review_checklist
+    attributes:
+      label: Review Checklist
+      options:
+        - label: "IP CIDR confirmed non-overlapping with existing allocations"
+        - label: "Naming convention validated (app name, environment, region)"
+        - label: "Management group placement appropriate for workload type"
+        - label: "Data classification reviewed — additional controls applied if CONFIDENTIAL+"
+        - label: "Internet egress requirements reviewed and Checkpoint policy scope agreed"
+        - label: "Defender for Cloud plan appropriate for workload risk"
+        - label: "Budget alert configured in subscription vending parameters"
+        - label: "AAD group confirmed to exist and have correct members"
+        - label: "Security team sign-off obtained (for CONFIDENTIAL+ or full internet egress)"
+        - label: "Network team IP allocation confirmed"
+        - label: "Platform team approved — .bicepparam file raised as PR"

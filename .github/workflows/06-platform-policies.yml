@@ -1,0 +1,76 @@
+name: "06 - Platform: Azure Policy Assignments"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/policies/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_TENANT_ID:            ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:            ${{ secrets.AZURE_CLIENT_ID }}
+  ROOT_MG_ID:                 "alz"
+  LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+  SENTINEL_SECURITY_CONTACT:  ${{ secrets.SENTINEL_SECURITY_CONTACT }}
+
+jobs:
+  lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: az bicep build --file platform/policies/main.bicep
+
+  what-if:
+    name: What-If Policy Assignments
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          tenant-id:  ${{ env.AZURE_TENANT_ID }}
+          client-id:  ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+      - run: |
+          az deployment mg what-if \
+            --name "alz-policies-whatif-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --management-group-id "${{ env.ROOT_MG_ID }}" \
+            --template-file platform/policies/main.bicep \
+            --parameters \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+              securityContactEmail="${{ env.SENTINEL_SECURITY_CONTACT }}"
+
+  deploy:
+    name: Deploy Policy Assignments
+    runs-on: ubuntu-latest
+    needs: what-if
+    environment: platform-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          tenant-id:  ${{ env.AZURE_TENANT_ID }}
+          client-id:  ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+      - name: Deploy Policies
+        run: |
+          az deployment mg create \
+            --name "alz-policies-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --management-group-id "${{ env.ROOT_MG_ID }}" \
+            --template-file platform/policies/main.bicep \
+            --parameters \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+              securityContactEmail="${{ env.SENTINEL_SECURITY_CONTACT }}" \
+            --output json | tee policy-output.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: policy-output
+          path: policy-output.json

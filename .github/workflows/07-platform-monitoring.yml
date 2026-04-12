@@ -1,0 +1,87 @@
+name: "07 - Platform: Monitoring (Azure Monitor + Network Watcher)"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/monitoring/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_TENANT_ID:             ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:             ${{ secrets.AZURE_CLIENT_ID }}
+  MANAGEMENT_SUBSCRIPTION_ID:  ${{ secrets.MANAGEMENT_SUBSCRIPTION_ID }}
+  CONNECTIVITY_SUBSCRIPTION_ID: ${{ secrets.CONNECTIVITY_SUBSCRIPTION_ID }}
+  LOG_ANALYTICS_WORKSPACE_ID:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+  OPS_ALERT_EMAIL:             ${{ secrets.OPS_ALERT_EMAIL }}
+  SENTINEL_SECURITY_CONTACT:   ${{ secrets.SENTINEL_SECURITY_CONTACT }}
+  ER_CIRCUIT_RESOURCE_ID:      ${{ secrets.ER_CIRCUIT_RESOURCE_ID }}
+  CHECKPOINT_VM_RESOURCE_ID:   ${{ secrets.CHECKPOINT_VM_RESOURCE_ID }}
+
+jobs:
+  lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: az bicep build --file platform/monitoring/main.bicep
+
+  what-if:
+    name: What-If Monitoring
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          subscription-id: ${{ env.MANAGEMENT_SUBSCRIPTION_ID }}
+      - run: |
+          az deployment sub what-if \
+            --name "alz-monitoring-whatif-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --subscription "${{ env.MANAGEMENT_SUBSCRIPTION_ID }}" \
+            --template-file platform/monitoring/main.bicep \
+            --parameters \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+              opsAlertEmail="${{ env.OPS_ALERT_EMAIL }}" \
+              secAlertEmail="${{ env.SENTINEL_SECURITY_CONTACT }}" \
+              connectivitySubscriptionId="${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}" \
+              erCircuitResourceId="${{ env.ER_CIRCUIT_RESOURCE_ID }}" \
+              checkpointVmResourceId="${{ env.CHECKPOINT_VM_RESOURCE_ID }}"
+
+  deploy:
+    name: Deploy Monitoring
+    runs-on: ubuntu-latest
+    needs: what-if
+    environment: platform-production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          subscription-id: ${{ env.MANAGEMENT_SUBSCRIPTION_ID }}
+      - run: |
+          az deployment sub create \
+            --name "alz-monitoring-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --subscription "${{ env.MANAGEMENT_SUBSCRIPTION_ID }}" \
+            --template-file platform/monitoring/main.bicep \
+            --parameters \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+              opsAlertEmail="${{ env.OPS_ALERT_EMAIL }}" \
+              secAlertEmail="${{ env.SENTINEL_SECURITY_CONTACT }}" \
+              connectivitySubscriptionId="${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}" \
+              erCircuitResourceId="${{ env.ER_CIRCUIT_RESOURCE_ID }}" \
+              checkpointVmResourceId="${{ env.CHECKPOINT_VM_RESOURCE_ID }}" \
+            --output json | tee monitoring-output.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-output
+          path: monitoring-output.json
