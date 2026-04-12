@@ -1,0 +1,133 @@
+name: "03 - Platform: Connectivity (Hub Network + Checkpoint NVA + ExpressRoute)"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/connectivity/**'
+  workflow_dispatch:
+    inputs:
+      checkpoint_sku:
+        description: 'Checkpoint SKU'
+        required: true
+        default: 'sg-byol'
+        type: choice
+        options: [sg-byol, sg-ngtp, sg-ngtx]
+      er_bandwidth:
+        description: 'ExpressRoute bandwidth (Mbps)'
+        required: true
+        default: '1000'
+        type: choice
+        options: ['50','100','200','500','1000','2000','5000','10000']
+      er_provider:
+        description: 'ExpressRoute service provider name'
+        required: true
+        default: 'Equinix'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_TENANT_ID:             ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:             ${{ secrets.AZURE_CLIENT_ID }}
+  CONNECTIVITY_SUBSCRIPTION_ID: ${{ secrets.CONNECTIVITY_SUBSCRIPTION_ID }}
+  CHECKPOINT_ADMIN_PASSWORD:   ${{ secrets.CHECKPOINT_ADMIN_PASSWORD }}
+  LOG_ANALYTICS_WORKSPACE_ID:  ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+
+jobs:
+  lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Connectivity Bicep
+        run: |
+          az bicep build --file platform/connectivity/main.bicep
+          az bicep build --file platform/connectivity/modules/checkpoint-nva.bicep
+
+  what-if:
+    name: What-If (Dry Run)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          subscription-id: ${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}
+
+      - name: What-If Hub Network + ExpressRoute
+        run: |
+          az deployment sub what-if \
+            --name "alz-connectivity-whatif-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --subscription "${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}" \
+            --template-file platform/connectivity/main.bicep \
+            --parameters platform/connectivity/parameters/hub-networking.bicepparam \
+            --parameters \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+              checkpointAdminPassword="${{ env.CHECKPOINT_ADMIN_PASSWORD }}" \
+              checkpointSku="${{ github.event.inputs.checkpoint_sku || 'sg-byol' }}" \
+              erBandwidthInMbps="${{ github.event.inputs.er_bandwidth || '1000' }}" \
+              erServiceProviderName="${{ github.event.inputs.er_provider || 'Equinix' }}"
+
+  deploy:
+    name: Deploy Hub Network + Checkpoint NVA + ExpressRoute
+    runs-on: ubuntu-latest
+    needs: what-if
+    environment: platform-production
+    outputs:
+      hub-vnet-id:    ${{ steps.deploy.outputs.hubVnetId }}
+      route-table-id: ${{ steps.deploy.outputs.routeTableId }}
+      er-circuit-id:  ${{ steps.deploy.outputs.erCircuitId }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          subscription-id: ${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}
+
+      - name: Deploy Hub Network + ER + Checkpoint
+        id: deploy
+        run: |
+          OUTPUT=$(az deployment sub create \
+            --name "alz-connectivity-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --subscription "${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}" \
+            --template-file platform/connectivity/main.bicep \
+            --parameters platform/connectivity/parameters/hub-networking.bicepparam \
+            --parameters \
+              logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
+              checkpointAdminPassword="${{ env.CHECKPOINT_ADMIN_PASSWORD }}" \
+              checkpointSku="${{ github.event.inputs.checkpoint_sku || 'sg-byol' }}" \
+              erBandwidthInMbps="${{ github.event.inputs.er_bandwidth || '1000' }}" \
+              erServiceProviderName="${{ github.event.inputs.er_provider || 'Equinix' }}" \
+            --output json)
+
+          echo "$OUTPUT" | tee connectivity-output.json
+          echo "hubVnetId=$(echo "$OUTPUT"   | jq -r '.properties.outputs.hubVnetId.value')"  >> "$GITHUB_OUTPUT"
+          echo "routeTableId=$(echo "$OUTPUT" | jq -r '.properties.outputs.routeTableId.value')" >> "$GITHUB_OUTPUT"
+          echo "erCircuitId=$(echo "$OUTPUT"  | jq -r '.properties.outputs.erCircuitId.value')"  >> "$GITHUB_OUTPUT"
+
+      - name: Upload Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: connectivity-output
+          path: connectivity-output.json
+
+      - name: Post-deploy instructions
+        run: |
+          echo "## Post-Deploy Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. **ExpressRoute**: Provider must provision the circuit. \
+            Status will show *NotProvisioned* until complete." >> $GITHUB_STEP_SUMMARY
+          echo "2. **Checkpoint NVA**: Connect via on-prem jump host over ER to \`10.0.0.4\` \
+            and complete First Time Configuration wizard." >> $GITHUB_STEP_SUMMARY
+          echo "3. **Secrets to update**: Set \`HUB_VNET_ID\`, \`ROUTE_TABLE_ID\` in GitHub secrets." >> $GITHUB_STEP_SUMMARY
+          echo "   - HUB_VNET_ID: $(cat connectivity-output.json | jq -r '.properties.outputs.hubVnetId.value')" >> $GITHUB_STEP_SUMMARY
+          echo "   - ROUTE_TABLE_ID: $(cat connectivity-output.json | jq -r '.properties.outputs.routeTableId.value')" >> $GITHUB_STEP_SUMMARY

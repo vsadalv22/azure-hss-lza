@@ -1,0 +1,162 @@
+name: "04 - Subscription Vending Machine"
+
+# ============================================================
+# Triggered manually or by pull request adding a new
+# subscription parameters file under subscription-vending/parameters/
+# ============================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'subscription-vending/parameters/**.bicepparam'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'subscription-vending/parameters/**.bicepparam'
+  workflow_dispatch:
+    inputs:
+      param_file:
+        description: 'Parameters file (relative path, e.g. subscription-vending/parameters/sub-contoso-retail-prod.bicepparam)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write   # Post what-if results as PR comment
+
+env:
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ROOT_MG_ID: "alz"
+  EA_BILLING_ACCOUNT: ${{ secrets.EA_BILLING_ACCOUNT }}
+  EA_ENROLLMENT_ACCOUNT: ${{ secrets.EA_ENROLLMENT_ACCOUNT }}
+  HUB_VNET_ID: ${{ secrets.HUB_VNET_ID }}
+  ROUTE_TABLE_ID: ${{ secrets.ROUTE_TABLE_ID }}
+  LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+
+jobs:
+  detect-changed-params:
+    name: Detect Changed Parameter Files
+    runs-on: ubuntu-latest
+    outputs:
+      param_files: ${{ steps.detect.outputs.param_files }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed .bicepparam files
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FILES='["${{ github.event.inputs.param_file }}"]'
+          else
+            FILES=$(git diff --name-only HEAD~1 HEAD -- 'subscription-vending/parameters/*.bicepparam' \
+              | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+          echo "param_files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "Detected files: $FILES"
+
+  what-if:
+    name: What-If for ${{ matrix.param_file }}
+    runs-on: ubuntu-latest
+    needs: detect-changed-params
+    if: needs.detect-changed-params.outputs.param_files != '[]'
+    strategy:
+      matrix:
+        param_file: ${{ fromJson(needs.detect-changed-params.outputs.param_files) }}
+      max-parallel: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+
+      - name: What-If Subscription Vend
+        id: whatif
+        run: |
+          RESULT=$(az deployment mg what-if \
+            --name "sub-vend-whatif-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --management-group-id "${{ env.ROOT_MG_ID }}" \
+            --template-file subscription-vending/main.bicep \
+            --parameters "${{ matrix.param_file }}" \
+            --parameters eaBillingAccountName="${EA_BILLING_ACCOUNT}" \
+                         eaEnrollmentAccountName="${EA_ENROLLMENT_ACCOUNT}" \
+                         hubVnetId="${HUB_VNET_ID}" \
+                         routeTableId="${ROUTE_TABLE_ID}" \
+                         logAnalyticsWorkspaceId="${LOG_ANALYTICS_WORKSPACE_ID}" \
+            2>&1 || true)
+          echo "$RESULT"
+          {
+            echo 'WHATIF_RESULT<<EOF'
+            echo "$RESULT"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post What-If as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const file = '${{ matrix.param_file }}';
+            const result = `${{ steps.whatif.outputs.WHATIF_RESULT }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## Subscription Vending What-If: \`${file}\`\n\`\`\`\n${result}\n\`\`\``
+            });
+
+  deploy:
+    name: Vend Subscription - ${{ matrix.param_file }}
+    runs-on: ubuntu-latest
+    needs: what-if
+    if: github.event_name != 'pull_request'   # Only deploy on push to main or manual trigger
+    environment: subscription-vending         # Requires approval
+    strategy:
+      matrix:
+        param_file: ${{ fromJson(needs.detect-changed-params.outputs.param_files) }}
+      max-parallel: 1    # Vend one subscription at a time
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Vend Subscription
+        id: vend
+        run: |
+          OUTPUT=$(az deployment mg create \
+            --name "sub-vend-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --management-group-id "${{ env.ROOT_MG_ID }}" \
+            --template-file subscription-vending/main.bicep \
+            --parameters "${{ matrix.param_file }}" \
+            --parameters eaBillingAccountName="${EA_BILLING_ACCOUNT}" \
+                         eaEnrollmentAccountName="${EA_ENROLLMENT_ACCOUNT}" \
+                         hubVnetId="${HUB_VNET_ID}" \
+                         routeTableId="${ROUTE_TABLE_ID}" \
+                         logAnalyticsWorkspaceId="${LOG_ANALYTICS_WORKSPACE_ID}" \
+            --output json)
+
+          echo "$OUTPUT" | tee subscription-output.json
+          SUB_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.subscriptionId.value')
+          VNET_ID=$(echo "$OUTPUT" | jq -r '.properties.outputs.spokeVnetResourceId.value')
+          echo "subscriptionId=$SUB_ID"   >> "$GITHUB_OUTPUT"
+          echo "spokeVnetId=$VNET_ID"     >> "$GITHUB_OUTPUT"
+          echo "::notice title=Subscription Vended::New subscription ID: $SUB_ID | Spoke VNet: $VNET_ID"
+
+      - name: Upload Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: subscription-vending-output-${{ github.run_number }}
+          path: subscription-output.json

@@ -1,0 +1,77 @@
+name: "01 - Platform: Management Groups"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/management-groups/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+
+env:
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}       # App registration client ID
+  ROOT_MANAGEMENT_GROUP_ID: "alz"
+
+jobs:
+  lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bicep lint
+        run: az bicep build --file platform/management-groups/main.bicep
+
+  what-if:
+    name: What-If (Dry Run)
+    runs-on: ubuntu-latest
+    needs: lint
+    environment: platform-review   # Requires approval for what-if review
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true   # Tenant-scope deployment needs this
+
+      - name: What-If Deployment
+        run: |
+          az deployment tenant what-if \
+            --name "alz-management-groups-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --template-file platform/management-groups/main.bicep \
+            --parameters rootManagementGroupId="${ROOT_MANAGEMENT_GROUP_ID}"
+
+  deploy:
+    name: Deploy Management Groups
+    runs-on: ubuntu-latest
+    needs: what-if
+    environment: platform-production   # Requires manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Deploy Management Groups
+        run: |
+          az deployment tenant create \
+            --name "alz-management-groups-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --template-file platform/management-groups/main.bicep \
+            --parameters rootManagementGroupId="${ROOT_MANAGEMENT_GROUP_ID}" \
+            --output json | tee deployment-output.json
+
+      - name: Upload Deployment Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: management-groups-output
+          path: deployment-output.json

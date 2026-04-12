@@ -1,0 +1,29 @@
+{
+  "$schema": "https://aka.ms/bicep-config-schema",
+  "analyzers": {
+    "core": {
+      "enabled": true,
+      "verbose": false,
+      "rules": {
+        "no-unused-params": { "level": "warning" },
+        "no-unused-vars":   { "level": "warning" },
+        "prefer-interpolation": { "level": "warning" },
+        "secure-parameter-default": { "level": "error" },
+        "protect-commandtoexecute-secrets": { "level": "error" },
+        "adminusername-should-not-be-literal": { "level": "warning" },
+        "no-hardcoded-env-urls": { "level": "warning" }
+      }
+    }
+  },
+  "moduleAliases": {
+    "br": {
+      "public": {
+        "registry": "mcr.microsoft.com",
+        "modulePath": "bicep"
+      }
+    }
+  },
+  "experimentalFeaturesEnabled": {
+    "extensibility": false
+  }
+}

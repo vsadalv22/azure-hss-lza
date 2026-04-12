@@ -1,0 +1,142 @@
+# ============================================================
+# Azure Landing Zone Bicep Accelerator — Input Configuration
+# Region   : Australia East
+# Topology : Hub & Spoke
+# WAN Edge : ExpressRoute (Standard / UnlimitedData)
+# NVA      : Checkpoint CloudGuard
+# SIEM     : Microsoft Sentinel
+# NOTE     : Azure Bastion is NOT deployed — management access
+#            is via on-premises jump hosts over ExpressRoute
+# ============================================================
+
+# ---- Core Settings ----
+azure_location: australiaeast
+root_management_group_display_name: "Azure Landing Zones"
+root_management_group_id: alz
+
+# ---- Subscription IDs (EA — fill in after subscriptions are created) ----
+subscription_id_management:   ""    # Management / SOC subscription
+subscription_id_connectivity: ""    # Connectivity / Networking subscription
+subscription_id_identity:     ""    # Identity (AD DS) subscription
+
+# ---- EA Billing (Enterprise Agreement) ----
+billing_account_name:    ""         # EA Billing Account ID  (e.g. 12345678)
+enrollment_account_name: ""         # EA Enrollment Account  (e.g. 987654)
+
+# ---- Management Group Hierarchy ----
+management_group_settings:
+  root_id: "alz"
+  platform_id: "platform"
+  landing_zones_id: "landingzones"
+  sandbox_id: "sandbox"
+  decommissioned_id: "decommissioned"
+  platform_children:
+    - id: "management"
+      display_name: "Management"
+    - id: "connectivity"
+      display_name: "Connectivity"
+    - id: "identity"
+      display_name: "Identity"
+  landing_zone_children:
+    - id: "corp"
+      display_name: "Corp"
+    - id: "online"
+      display_name: "Online"
+
+# ---- Networking (Hub & Spoke — no Bastion) ----
+network_settings:
+  type: hubNetworking
+  hub_vnet_name: "vnet-hub-australiaeast-001"
+  hub_vnet_address_prefix: "10.0.0.0/16"
+  hub_location: australiaeast
+  bastion_enabled: false            # Access via ExpressRoute from on-prem
+
+  subnets:
+    - name: "snet-checkpoint-external"
+      address_prefix: "10.0.0.0/28"
+    - name: "snet-checkpoint-internal"
+      address_prefix: "10.0.1.0/28"
+    - name: "snet-management"
+      address_prefix: "10.0.2.0/24"
+    - name: "GatewaySubnet"
+      address_prefix: "10.0.3.0/27"   # ExpressRoute Gateway
+
+  # Checkpoint CloudGuard NVA
+  checkpoint_nva:
+    enabled: true
+    vm_name: "vm-checkpoint-hub-001"
+    vm_size: "Standard_D3_v2"
+    admin_username: "azureadmin"
+    os_disk_type: "Premium_LRS"
+    publisher: "checkpoint"
+    offer: "check-point-cg-r8110"
+    sku: "sg-byol"                    # sg-byol | sg-ngtp | sg-ngtx
+    version: "latest"
+    internal_ip: "10.0.1.4"           # Static — referenced in UDR
+
+  # ExpressRoute (replaces VPN Gateway — no Bastion)
+  expressroute:
+    enabled: true
+    circuit_name: "erc-hub-australiaeast-001"
+    service_provider: ""             # e.g. Equinix, Megaport, Telstra
+    peering_location: "Sydney"       # ER peering location (not Azure region)
+    bandwidth_mbps: 1000             # 1 Gbps
+    sku_tier: "Standard"
+    sku_family: "UnlimitedData"
+    gateway_name: "ergw-hub-australiaeast-001"
+    gateway_sku: "ErGw1AZ"           # Zone-redundant; ErGw2AZ for 10G
+
+# ---- Logging & Monitoring ----
+logging_settings:
+  log_analytics_workspace_name: "law-management-australiaeast-001"
+  log_analytics_sku: "PerGB2018"
+  log_analytics_retention_days: 365
+  automation_account_name: "aa-management-australiaeast-001"
+
+# ---- Microsoft Sentinel ----
+sentinel_settings:
+  enabled: true
+  workspace: "law-management-australiaeast-001"   # Same LAW as logging
+  daily_quota_gb: -1                               # -1 = no cap
+  retention_days: 365
+  ueba_enabled: true
+  ueba_data_sources:
+    - AuditLogs
+    - AzureActivity
+    - SecurityEvent
+    - SigninLogs
+  data_connectors:
+    - AzureActiveDirectory
+    - AzureActivity
+    - AzureSecurityCenter          # Defender for Cloud
+    - MicrosoftThreatProtection    # Defender XDR
+    - MicrosoftDefenderAdvancedThreatProtection
+    - AzureAdvancedThreatProtection
+    - Office365
+    - ThreatIntelligence
+  analytics_rules:
+    - ImpossibleTravel
+    - PrivilegeEscalation
+    - MassResourceDeletion
+    - NvaConfigChange
+    - PasswordSpray
+
+# ---- Identity ----
+identity_settings:
+  vnet_name: "vnet-identity-australiaeast-001"
+  vnet_address_prefix: "10.10.0.0/16"
+  subnets:
+    - name: "snet-domain-controllers"
+      address_prefix: "10.10.0.0/24"
+
+# ---- Subscription Vending ----
+subscription_vending:
+  enabled: true
+  management_group_association_enabled: true
+  virtual_network_enabled: true
+  virtual_network_peering_enabled: true
+  role_assignment_enabled: true
+  default_route_via_checkpoint: true    # UDR 0.0.0.0/0 -> Checkpoint internal IP
+  tags:
+    environment: "production"
+    managed_by: "platform-team"

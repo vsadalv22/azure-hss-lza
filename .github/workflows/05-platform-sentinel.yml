@@ -1,0 +1,96 @@
+name: "05 - Platform: Microsoft Sentinel"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'platform/sentinel/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_TENANT_ID:           ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:           ${{ secrets.AZURE_CLIENT_ID }}
+  MANAGEMENT_SUBSCRIPTION_ID: ${{ secrets.MANAGEMENT_SUBSCRIPTION_ID }}
+  SENTINEL_SECURITY_CONTACT: ${{ secrets.SENTINEL_SECURITY_CONTACT }}
+
+jobs:
+  lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Sentinel Bicep
+        run: az bicep build --file platform/sentinel/main.bicep
+
+  what-if:
+    name: What-If (Dry Run)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          subscription-id: ${{ env.MANAGEMENT_SUBSCRIPTION_ID }}
+
+      - name: What-If Sentinel
+        run: |
+          az deployment sub what-if \
+            --name "alz-sentinel-whatif-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --subscription "${{ env.MANAGEMENT_SUBSCRIPTION_ID }}" \
+            --template-file platform/sentinel/main.bicep \
+            --parameters platform/sentinel/parameters/sentinel.bicepparam \
+            --parameters securityContactEmail="${{ env.SENTINEL_SECURITY_CONTACT }}"
+
+  deploy:
+    name: Deploy Microsoft Sentinel
+    runs-on: ubuntu-latest
+    needs: what-if
+    environment: platform-production   # Requires manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id:       ${{ env.AZURE_TENANT_ID }}
+          client-id:       ${{ env.AZURE_CLIENT_ID }}
+          subscription-id: ${{ env.MANAGEMENT_SUBSCRIPTION_ID }}
+
+      - name: Deploy Sentinel
+        id: deploy
+        run: |
+          OUTPUT=$(az deployment sub create \
+            --name "alz-sentinel-$(date +%Y%m%d%H%M%S)" \
+            --location australiaeast \
+            --subscription "${{ env.MANAGEMENT_SUBSCRIPTION_ID }}" \
+            --template-file platform/sentinel/main.bicep \
+            --parameters platform/sentinel/parameters/sentinel.bicepparam \
+            --parameters securityContactEmail="${{ env.SENTINEL_SECURITY_CONTACT }}" \
+            --output json)
+
+          echo "$OUTPUT" | tee sentinel-output.json
+          echo "::notice title=Sentinel Deployed::Microsoft Sentinel is now enabled. \
+            Complete watchlist population and TAXII feed configuration in the Sentinel portal."
+
+      - name: Upload Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-output
+          path: sentinel-output.json
+
+      - name: Post-deploy checklist
+        run: |
+          echo "## Post-Deploy Checklist" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Populate TrustedIPRanges watchlist with on-prem CIDR blocks (via ER)" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Configure TAXII Threat Intelligence feed URL" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Assign Sentinel Contributor role to SOC team AAD group" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Enable Defender for Cloud Standard tier on all subscriptions" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Validate data connector ingestion in Sentinel portal" >> $GITHUB_STEP_SUMMARY
+          echo "- [ ] Review and tune Analytics Rules thresholds" >> $GITHUB_STEP_SUMMARY

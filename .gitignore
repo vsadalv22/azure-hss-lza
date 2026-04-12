@@ -1,0 +1,23 @@
+# Build artefacts
+*.json.bak
+*.bicep.bak
+
+# Sensitive files — never commit
+*.env
+.env.*
+secrets.yaml
+secrets.json
+
+# Deployment outputs (contain subscription IDs / resource IDs)
+*-output.json
+deployment-output.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+*.swp
+*~
+
+# PowerShell session history
+ConsoleHost_history.txt
