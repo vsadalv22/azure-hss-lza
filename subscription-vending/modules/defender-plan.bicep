@@ -1,28 +1,37 @@
-// =============================================================
-// Module: Enable a Microsoft Defender for Cloud plan
-// Deployed as a nested subscription-scope resource
-// =============================================================
+targetScope = 'subscription'
 
-@description('Subscription ID to enable Defender on')
-param subscriptionId string
+@description('Microsoft Defender for Cloud pricing tier name')
+@allowed([
+  'VirtualMachines'
+  'StorageAccounts'
+  'KeyVaults'
+  'SqlServers'
+  'SqlServerVirtualMachines'
+  'Containers'
+  'AppServices'
+  'Dns'
+  'Arm'
+  'OpenSourceRelationalDatabases'
+  'CosmosDbs'
+])
+param pricingTierName string
 
-@description('Defender plan name — VirtualMachines | StorageAccounts | KeyVaults | SqlServers | Containers | Dns | Arm')
-param planName string
-
-@description('Pricing tier: Standard | Free')
-@allowed(['Standard', 'Free'])
+@description('Pricing tier: Free or Standard')
+@allowed(['Free', 'Standard'])
 param pricingTier string = 'Standard'
 
-@description('Sub-plan (only applicable to VirtualMachines): P1 | P2')
-param subPlanName string = ''
+@description('Sub-plan for VirtualMachines: P1 (Foundational) or P2 (Enhanced)')
+@allowed(['P1', 'P2', ''])
+param subPlan string = ''
 
 resource defenderPlan 'Microsoft.Security/pricings@2023-01-01' = {
-  name: planName
-  scope: subscription(subscriptionId) // workaround — deploy in target sub via nested deployment
+  name: pricingTierName
   properties: {
     pricingTier: pricingTier
-    subPlan: empty(subPlanName) ? null : subPlanName
+    subPlan: empty(subPlan) ? null : subPlan
   }
 }
 
 output defenderPlanId string = defenderPlan.id
+output defenderPlanName string = defenderPlan.name
+output pricingState string = defenderPlan.properties.pricingTier

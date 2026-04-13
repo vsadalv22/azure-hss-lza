@@ -14,15 +14,15 @@ targetScope = 'subscription'
 //            → ErGw1  (NOT ErGw1AZ — no zone-redundant SKUs in PEZ)
 //            → No zones: [] on PIPs (PEZ does not support AZs)
 //
-// VNet layout (PEZ):
-//   vnet-hub-pez-001              10.2.0.0/16  — egress / hybrid
-//     snet-checkpoint-internal    10.2.1.0/28  — Checkpoint eth1
-//     snet-management             10.2.2.0/24  — jump hosts
-//     GatewaySubnet               10.2.3.0/27  — ER Gateway
+// VNet layout (PEZ — default CIDRs derived from hubVnetAddressPrefix/ingressVnetAddressPrefix):
+//   vnet-hub-pez-001              hubVnetAddressPrefix (/16)  — egress / hybrid
+//     snet-checkpoint-internal    cidrSubnet(/16, 12, 16)     — Checkpoint eth1 e.g. 10.2.1.0/28
+//     snet-management             cidrSubnet(/16,  8,  2)     — jump hosts       e.g. 10.2.2.0/24
+//     GatewaySubnet               cidrSubnet(/16, 11, 24)     — ER Gateway        e.g. 10.2.3.0/27
 //
-//   vnet-ingress-pez-001          10.3.0.0/16  — internet-facing / DMZ
-//     snet-checkpoint-external    10.3.0.0/28  — Checkpoint eth0
-//     snet-ingress-dmz            10.3.1.0/24  — DMZ workloads
+//   vnet-ingress-pez-001          ingressVnetAddressPrefix (/16)  — internet-facing / DMZ
+//     snet-checkpoint-external    cidrSubnet(/16, 12,  0)     — Checkpoint eth0  e.g. 10.3.0.0/28
+//     snet-ingress-dmz            cidrSubnet(/16,  8,  1)     — DMZ workloads    e.g. 10.3.1.0/24
 //
 // Extended Zone configuration:
 //   All VNet and Gateway resources carry:
@@ -75,6 +75,13 @@ param erGatewaySku string = 'ErGw1'
 @description('DDoS Protection Plan resource ID — reuse the Australia East plan (DD34). Output ddosProtectionPlanId from platform/connectivity/main.bicep.')
 param ddosProtectionPlanId string
 
+@description('Number of Checkpoint VMSS instances in PEZ. Minimum 1 (reduced footprint), recommend 2 for HA.')
+@minValue(1)
+param checkpointInstanceCount int = 2
+
+@description('On-premises network CIDR — restricts management subnet NSG inbound rules to on-prem only')
+param onPremAddressSpace string = '10.0.0.0/8'
+
 @description('Resource tags')
 param tags object = {
   environment: 'connectivity'
@@ -82,6 +89,26 @@ param tags object = {
   createdBy  : 'alz-bicep'
   location   : 'pez-perth'
 }
+
+// ── Derived Subnet CIDRs (from hubVnetAddressPrefix) ──────────────────
+// cidrSubnet(prefix, newbits, index) — all derived from /16 base:
+//   hubSubnetInternal : /16 + 12 bits = /28, block 16 → e.g. 10.2.1.0/28
+//   hubSubnetMgmt     : /16 +  8 bits = /24, block 2  → e.g. 10.2.2.0/24
+//   hubSubnetGateway  : /16 + 11 bits = /27, block 24 → e.g. 10.2.3.0/27
+var hubSubnetInternal  = cidrSubnet(hubVnetAddressPrefix, 12, 16)
+var hubSubnetMgmt      = cidrSubnet(hubVnetAddressPrefix, 8,  2)
+var hubSubnetGateway   = cidrSubnet(hubVnetAddressPrefix, 11, 24)
+
+// ── Derived Subnet CIDRs (from ingressVnetAddressPrefix) ──────────────
+//   ingressSubnetExternal: /16 + 12 bits = /28, block 0 → e.g. 10.3.0.0/28
+//   ingressSubnetDmz     : /16 +  8 bits = /24, block 1 → e.g. 10.3.1.0/24
+var ingressSubnetExternal = cidrSubnet(ingressVnetAddressPrefix, 12, 0)
+var ingressSubnetDmz      = cidrSubnet(ingressVnetAddressPrefix, 8,  1)
+
+// ── Derived Static Host IPs ──────────────────────────────────────────
+// Azure reserves .0–.3 in every subnet; first usable host = index 4
+var checkpointInternalIp = cidrHost(hubSubnetInternal, 4)
+var checkpointExternalIp = cidrHost(ingressSubnetExternal, 4)
 
 // ============================================================
 // Resource Group
@@ -176,7 +203,7 @@ module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0
           protocol: 'Tcp'
           access: 'Allow'
           direction: 'Inbound'
-          sourceAddressPrefixes: ['10.0.0.0/8']   // On-prem only
+          sourceAddressPrefixes: [onPremAddressSpace]   // On-prem only
           sourcePortRange: '*'
           destinationAddressPrefix: '*'
           destinationPortRanges: ['18190', '19009', '257', '8211']
@@ -227,7 +254,7 @@ module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
         properties: {
           addressPrefix   : '0.0.0.0/0'
           nextHopType     : 'VirtualAppliance'
-          nextHopIpAddress: '10.2.1.4'   // PEZ Internal LB frontend static IP
+          nextHopIpAddress: checkpointInternalIp   // PEZ Internal LB frontend static IP (cidrHost-derived)
         }
       }
     ]
@@ -262,7 +289,7 @@ resource hubVnetResource 'Microsoft.Network/virtualNetworks@2023-09-01' = {
       {
         name: 'snet-checkpoint-internal'
         properties: {
-          addressPrefix: '10.2.1.0/28'
+          addressPrefix: hubSubnetInternal
           networkSecurityGroup: {
             id: nsgCheckpointInternal.outputs.resourceId
           }
@@ -271,7 +298,7 @@ resource hubVnetResource 'Microsoft.Network/virtualNetworks@2023-09-01' = {
       {
         name: 'snet-management'
         properties: {
-          addressPrefix: '10.2.2.0/24'
+          addressPrefix: hubSubnetMgmt
           routeTable: {
             id: routeTableSpoke.outputs.resourceId
           }
@@ -281,7 +308,7 @@ resource hubVnetResource 'Microsoft.Network/virtualNetworks@2023-09-01' = {
         // Reserved for ER Gateway — no NSG or UDR
         name: 'GatewaySubnet'
         properties: {
-          addressPrefix: '10.2.3.0/27'
+          addressPrefix: hubSubnetGateway
         }
       }
     ]
@@ -325,7 +352,7 @@ resource ingressVnetResource 'Microsoft.Network/virtualNetworks@2023-09-01' = {
       {
         name: 'snet-checkpoint-external'
         properties: {
-          addressPrefix: '10.3.0.0/28'
+          addressPrefix: ingressSubnetExternal
           networkSecurityGroup: {
             id: nsgCheckpointExternal.outputs.resourceId
           }
@@ -334,7 +361,7 @@ resource ingressVnetResource 'Microsoft.Network/virtualNetworks@2023-09-01' = {
       {
         name: 'snet-ingress-dmz'
         properties: {
-          addressPrefix: '10.3.1.0/24'
+          addressPrefix: ingressSubnetDmz
           networkSecurityGroup: {
             id: nsgIngressDmz.outputs.resourceId
           }
@@ -465,11 +492,12 @@ resource erGatewayDiag 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview
 //
 // PEZ uses instanceCount = 1 (reduced footprint for secondary site).
 // The VMSS module handles its own Internal and External LBs.
-// Internal LB frontend IP: 10.2.1.4 (matches UDR next-hop above).
+// Internal LB frontend IP: checkpointInternalIp = cidrHost(hubSubnetInternal, 4)
+//   matches UDR next-hop above and the first usable host in the internal subnet.
 //
 // NOTE: The checkpoint-vmss module uses resourceId() calls that
 //       assume the Internal LB name pattern. The internalSubnetId
-//       drives the frontend IP subnet — ensure it resolves to 10.2.1.x.
+//       drives the frontend IP subnet.
 // ============================================================
 module checkpointVmss '../modules/checkpoint-vmss.bicep' = {
   name : 'deploy-checkpoint-vmss-pez'
@@ -485,11 +513,13 @@ module checkpointVmss '../modules/checkpoint-vmss.bicep' = {
     externalSubnetId       : '${ingressVnetResource.id}/subnets/snet-checkpoint-external'
     // eth1 — internal NIC in hub VNet
     internalSubnetId       : '${hubVnetResource.id}/subnets/snet-checkpoint-internal'
-    externalPublicIpId     : checkpointExternalPip.outputs.resourceId
-    logAnalyticsWorkspaceId: logAnalyticsWorkspaceId
-    // DD17: PEZ is secondary — reduced footprint, 1 instance minimum
-    instanceCount          : 1
-    tags                   : tags
+    externalPublicIpId       : checkpointExternalPip.outputs.resourceId
+    logAnalyticsWorkspaceId  : logAnalyticsWorkspaceId
+    // DD17: PEZ is secondary — reduced footprint, parameterised for HA
+    instanceCount            : checkpointInstanceCount
+    internalLbFrontendIp     : checkpointInternalIp
+    checkpointExternalStaticIp: checkpointExternalIp
+    tags                     : tags
   }
 }
 

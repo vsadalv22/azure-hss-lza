@@ -1,12 +1,20 @@
 using '../main.bicep'
 
+// ⚠ CIDR Configuration — set these two address prefixes and ALL subnets/IPs are auto-derived:
+//   hubVnetAddressPrefix    : Hub VNet (ER gateway + Checkpoint internal NIC)
+//   ingressVnetAddressPrefix: Ingress VNet (internet-facing Checkpoint external NIC)
+//   onPremAddressSpace      : On-premises CIDR (used in NSG allow rules for management access)
+//
+// Do NOT hardcode individual subnet CIDRs — they are calculated automatically in main.bicep.
+
 // ============================================================
 // Hub Networking Parameters — Australia East
 //
 // What this deploys (IaC):
-//   • Hub VNet (10.0.0.0/16) with 4 subnets
+//   • Hub VNet (hubVnetAddressPrefix) with subnets derived via cidrSubnet()
+//   • Ingress VNet (ingressVnetAddressPrefix) with subnets derived via cidrSubnet()
 //   • ExpressRoute Gateway — ErGw1AZ (zone-redundant)
-//   • Checkpoint CloudGuard R81.10 NVA (dual NIC)
+//   • Checkpoint CloudGuard R81.10 NVA (dual NIC, IPs derived via cidrHost())
 //   • NSGs, Route Table (UDR → Checkpoint)
 //
 // What is NOT deployed by code:
@@ -17,6 +25,8 @@ using '../main.bicep'
 param location = 'australiaeast'
 
 param hubVnetAddressPrefix = '10.0.0.0/16'
+
+param onPremAddressSpace = '10.0.0.0/8'
 
 // Set via GitHub Actions secret: LOG_ANALYTICS_WORKSPACE_ID
 param logAnalyticsWorkspaceId = ''

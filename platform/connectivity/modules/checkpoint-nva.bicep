@@ -1,3 +1,4 @@
+// NOTE: This is the LEGACY single-VM module. Use checkpoint-vmss.bicep for production deployments (DD30).
 // ============================================================
 // Checkpoint CloudGuard Network Security - Hub NVA Module
 // Deploys Checkpoint CloudGuard as NVA in the hub network
@@ -31,6 +32,12 @@ param internalSubnetId string
 
 @description('External public IP resource ID')
 param externalPublicIpId string
+
+@description('Static private IP for the external NIC (eth0). Derived from ingressVnetAddressPrefix in the parent template using cidrHost(). Caller must provide — no default.')
+param externalStaticIp string
+
+@description('Static private IP for the internal NIC (eth1). Derived from hubVnetAddressPrefix in the parent template using cidrHost(). Caller must provide — no default.')
+param internalStaticIp string
 
 @description('Log Analytics workspace ID for boot diagnostics storage')
 param logAnalyticsWorkspaceId string
@@ -77,7 +84,7 @@ resource externalNic 'Microsoft.Network/networkInterfaces@2023-09-01' = {
         properties: {
           primary: true
           privateIPAllocationMethod: 'Static'
-          privateIPAddress: '10.0.0.4'
+          privateIPAddress: externalStaticIp
           subnet: {
             id: externalSubnetId
           }
@@ -104,7 +111,7 @@ resource internalNic 'Microsoft.Network/networkInterfaces@2023-09-01' = {
         properties: {
           primary: true
           privateIPAllocationMethod: 'Static'
-          privateIPAddress: '10.0.1.4'
+          privateIPAddress: internalStaticIp
           subnet: {
             id: internalSubnetId
           }
@@ -193,5 +200,5 @@ output checkpointVmId string = checkpointVm.id
 output checkpointVmName string = checkpointVm.name
 output externalNicId string = externalNic.id
 output internalNicId string = internalNic.id
-output checkpointInternalPrivateIp string = internalNic.properties.ipConfigurations[0].properties.privateIPAddress
-output checkpointExternalPrivateIp string = externalNic.properties.ipConfigurations[0].properties.privateIPAddress
+output checkpointInternalPrivateIp string = internalStaticIp
+output checkpointExternalPrivateIp string = externalStaticIp

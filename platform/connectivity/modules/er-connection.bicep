@@ -47,31 +47,22 @@ param logAnalyticsWorkspaceId string
 @description('DD23: Ensure traffic flows through the ER gateway (required for BFD). Set false to disable FastPath bypass.')
 param enableBgpFastFailover bool = true
 
-// ---- DD18: MACsec (ExpressRoute Direct only) ----
-//
-// IMPORTANT: MACsec is ONLY applicable to ExpressRoute Direct circuits
-// (circuits provisioned directly on Microsoft Edge routers, not via a
-// connectivity provider). Provider-based circuits do NOT support MACsec.
-//
-// MACsec configuration is set on the ExpressRoute Direct PORT resource
-// (Microsoft.Network/expressRoutePorts), NOT on the connection or circuit.
-// Since circuits in this project are created manually, MACsec must also
-// be configured manually on the port resource after provisioning:
+// ⚠ MACsec NOTE (DD18):
+// MACsec encryption applies to ExpressRoute DIRECT port pairs (physical layer).
+// It is configured on Microsoft.Network/expressRoutePorts — NOT on this connection resource.
+// The ExpressRoute circuit and port are created MANUALLY by the network team.
+// To configure MACsec on the port after manual circuit creation, run:
 //
 //   az network express-route port update \
-//     --name <port-name> \
 //     --resource-group <rg> \
-//     --set links[0].macSecConfig.cknSecretIdentifier=<kv-secret-uri> \
-//     --set links[0].macSecConfig.cakSecretIdentifier=<kv-secret-uri> \
-//     --set links[0].macSecConfig.cipher=GcmAes256
+//     --name <port-name> \
+//     --macsec-cipher GcmAes256 \
+//     --macsec-cak-secret-identifier <keyvault-uri> \
+//     --macsec-ckn-secret-identifier <keyvault-uri>
 //
-// The Key Vault secrets must be accessible by the ExpressRoute managed
-// identity. Grant 'Key Vault Secrets User' role to the ER service principal.
-//
-// The params below are informational — stored in this template for
-// documentation and future automation use. They do NOT affect the
-// connection resource deployed here.
-@description('DD18: MACsec applicable to ExpressRoute Direct ports only. Set true to document intent; actual config is on the port resource (manual).')
+// The params below are retained to document the intended configuration in code.
+// They do NOT affect the ARM deployment of this connection resource.
+@description('DD18: MACsec applicable to ExpressRoute Direct ports only. Set true to document intent; actual config is on the port resource (manual). (INFORMATIONAL: MACsec is configured on the ExpressRoute Direct port resource, not this connection. This param is used only for runbook documentation.)')
 param enableMacsec bool = false
 
 @description('DD18: Key Vault secret URI for MACsec CKN (Connectivity Association Key Name). ExpressRoute Direct ports only.')

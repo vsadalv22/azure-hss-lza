@@ -440,7 +440,7 @@ resource ruleHspCrossAccess 'Microsoft.SecurityInsights/alertRules@2023-02-01-pr
   kind: 'Scheduled'
   properties: {
     displayName: 'HSP Cross-Tenant Resource Access Detected'
-    description: 'DD40 — Fires when a principal tagged to one HSP performs write/delete operations on resources tagged to a different HSP management group. Indicates a potential data boundary violation across Health Service Providers.'
+    description: 'Detects when a user or service principal performs write/delete operations on resources tagged with an hsp-id different from their own HSP context. Requires hsp-id tags to be applied consistently via policy (DD36/DD40).'
     severity: 'High'
     enabled: true
     query: '''
@@ -448,19 +448,29 @@ resource ruleHspCrossAccess 'Microsoft.SecurityInsights/alertRules@2023-02-01-pr
       | where CategoryValue == "Administrative"
       | where ActivityStatusValue == "Success"
       | where OperationNameValue !endswith "/read"
-      | extend CallerHsp     = tostring(parse_json(Properties)["requestbody_tags_hsp-id"])
-      | extend ResourceHsp   = tostring(parse_json(Properties)["tags_hsp-id"])
-      | where isnotempty(CallerHsp) and isnotempty(ResourceHsp)
-      | where CallerHsp != ResourceHsp
+      // Extract HSP tag from the caller's resource context
+      // AzureActivity stores resource properties in the Properties field as JSON
+      | extend PropertiesJson = parse_json(Properties)
+      | extend ResourceHsp = tostring(PropertiesJson.["requestbody"]["tags"]["hsp-id"])
+      // For callers, use the Claims field which contains AAD token claims
+      | extend CallerClaims = parse_json(Claims)
+      | extend CallerHsp = tostring(CallerClaims.["xms_az_rid"])
+      // Alternative: use resource group tags via ResourceProviderValue + subscription
+      | extend SubscriptionId = tostring(split(ResourceId, "/")[2])
+      // Flag when a caller accesses a resource tagged with a different HSP
+      | where isnotempty(ResourceHsp)
+      | where ResourceHsp != "untagged"
+      // Join with the resource's tags using ResourceId
       | project
           TimeGenerated,
           Caller,
           CallerHsp,
           ResourceHsp,
+          ResourceId,
           OperationNameValue,
           ResourceGroup,
-          Resource,
           SubscriptionId
+      | where CallerHsp != ResourceHsp or isempty(CallerHsp)
     '''
     queryFrequency: 'PT15M'
     queryPeriod: 'PT15M'

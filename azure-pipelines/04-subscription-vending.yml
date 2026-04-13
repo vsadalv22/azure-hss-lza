@@ -416,6 +416,7 @@ stages:
             displayName: 'Re-detect param files for deployment'
 
           - task: AzureCLI@2
+            timeoutInMinutes: 90
             displayName: 'Deploy — Vend Subscriptions'
             name: VendStep
             inputs:

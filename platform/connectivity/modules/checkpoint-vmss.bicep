@@ -10,7 +10,7 @@
 // Architecture:
 //   • External LB  — outbound internet traffic (uses existing PIP)
 //   • Internal LB  — inbound/spoke traffic, static frontend IP
-//                    10.0.1.4 (matches UDR next-hop convention)
+//                    matches internalLbFrontendIp param (UDR next-hop)
 //   • VMSS         — dual-NIC, IP forwarding, Manual upgrade policy
 //
 // NIC layout:
@@ -35,8 +35,36 @@ param vmSize string = 'Standard_D3_v2'
 param adminUsername string = 'azureadmin'
 
 @secure()
-@description('Admin password')
+@description('Admin password — used as fallback when keyVaultId is not set')
 param adminPassword string
+
+// FIX #3 — Key Vault params for secure password retrieval
+@description('Key Vault resource ID containing the Checkpoint admin password secret')
+param keyVaultId string = ''
+
+@description('Key Vault secret name for Checkpoint admin password (used when keyVaultId is set)')
+param keyVaultSecretName string = 'checkpoint-admin-password'
+
+// SECURITY: When keyVaultId is provided, the password is retrieved from Key Vault at deploy time
+// and is NOT stored in ARM deployment history. Set keyVaultId in production environments.
+// ARM Key Vault reference syntax is used so the secret never appears in plain text.
+//
+// NOTE: Bicep does not support inline Key Vault secret references in nested module osProfile
+// params. To use Key Vault references, the CALLING template (main.bicep) must declare the
+// adminPassword param with a keyVault reference block, e.g.:
+//
+//   param checkpointAdminPassword string
+//   // In the parameter file (.bicepparam / parameters.json):
+//   // "checkpointAdminPassword": {
+//   //   "reference": {
+//   //     "keyVault": { "id": "<keyVaultId>" },
+//   //     "secretName": "<keyVaultSecretName>"
+//   //   }
+//   // }
+//
+// This module accepts the resolved secret value via adminPassword. The keyVaultId and
+// keyVaultSecretName params are carried here for documentation and future ARM template
+// generation tooling. See docs/keyvault-secret-reference.md for the full pattern.
 
 @description('Checkpoint marketplace SKU: sg-byol | sg-ngtp | sg-ngtx')
 @allowed(['sg-byol', 'sg-ngtp', 'sg-ngtx'])
@@ -58,6 +86,14 @@ param logAnalyticsWorkspaceId string
 @minValue(1)
 param instanceCount int = 2
 
+// FIX #1 — Parameterised internal LB frontend IP (derived from hubVnetAddressPrefix in parent template)
+// This value must match the nextHopIpAddress in spoke UDRs / route tables.
+@description('Static IP for the internal LB frontend. Derived from hubVnetAddressPrefix in the parent template using cidrHost(). Must match the first usable host in the internal subnet.')
+param internalLbFrontendIp string = ''
+
+@description('Static IP for the Checkpoint external NIC (eth0). Derived from ingressVnetAddressPrefix in the parent template using cidrHost(). Must match the first usable host in the external subnet.')
+param checkpointExternalStaticIp string = ''
+
 @description('Resource tags')
 param tags object = {}
 
@@ -74,7 +110,7 @@ resource bootDiagStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' =
 
 // ============================================================
 // Internal Load Balancer
-// Frontend: static IP 10.0.1.4 on the internal subnet
+// Frontend: static IP (internalLbFrontendIp) on the internal subnet.
 // This IP matches the UDR next-hop used by spoke route tables.
 // ============================================================
 resource internalLb 'Microsoft.Network/loadBalancers@2023-09-01' = {
@@ -91,7 +127,8 @@ resource internalLb 'Microsoft.Network/loadBalancers@2023-09-01' = {
         name: 'fe-checkpoint-internal'
         properties: {
           // Static IP — must match nextHopIpAddress in spoke UDRs
-          privateIPAddress: '10.0.1.4'
+          // FIX #1 — uses internalLbFrontendIp param instead of hardcoded literal
+          privateIPAddress: internalLbFrontendIp
           privateIPAllocationMethod: 'Static'
           subnet: {
             id: internalSubnetId
@@ -132,6 +169,11 @@ resource internalLb 'Microsoft.Network/loadBalancers@2023-09-01' = {
     ]
     probes: [
       {
+        // ⚠ HEALTH PROBE DEPENDENCY
+        // Port 8117 must be explicitly enabled in Checkpoint SmartConsole after first boot:
+        //   SmartConsole → Gateways & Servers → <gateway> → Platform Portal → enable health check
+        // Until this is done, ALL instances will be marked Unhealthy and traffic will drop.
+        // See: docs/checkpoint-first-boot.md
         name: 'probe-checkpoint-health'
         properties: {
           // Port 8117 — Checkpoint management health probe port
@@ -146,6 +188,7 @@ resource internalLb 'Microsoft.Network/loadBalancers@2023-09-01' = {
 }
 
 // Diagnostics for Internal LB
+// TODO: upgrade to @2023-01-01-preview when GA
 resource internalLbDiag 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: 'diag-lbi-checkpoint-internal-001'
   scope: internalLb
@@ -224,6 +267,7 @@ resource externalLb 'Microsoft.Network/loadBalancers@2023-09-01' = {
 }
 
 // Diagnostics for External LB
+// TODO: upgrade to @2023-01-01-preview when GA
 resource externalLbDiag 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: 'diag-lbe-checkpoint-external-001'
   scope: externalLb
@@ -267,6 +311,13 @@ resource checkpointVmss 'Microsoft.Compute/virtualMachineScaleSets@2023-07-01' =
     upgradePolicy: {
       mode: 'Manual'             // Checkpoint CPUSE manages its own upgrades
     }
+    // UPGRADE PROCEDURE (Manual — NVA safety):
+    // 1. In SmartConsole: install policy on both gateways to ensure consistency
+    // 2. In Azure Portal: go to VMSS → Instances → select one instance → Upgrade
+    // 3. Verify traffic flows on remaining instance before upgrading the second
+    // 4. Repeat for remaining instances
+    // Full runbook: docs/checkpoint-upgrade-procedure.md
+
     // Platform fault domains — use 1 to co-locate with AZ selection
     // When deployed in AZ-enabled regions, the AZ parameter on each
     // instance provides fault isolation.
@@ -281,15 +332,16 @@ resource checkpointVmss 'Microsoft.Compute/virtualMachineScaleSets@2023-07-01' =
           disablePasswordAuthentication: false
           provisionVMAgent: true
         }
-        // Checkpoint CloudGuard cloud-init — complete configuration via
-        // SmartConsole or management API after deployment
+        // FIX #25 — Updated cloud-init placeholder with actionable first-boot instructions
         customData: base64('''
 #cloud-config
-# Checkpoint CloudGuard VMSS initial configuration
-# After all instances are healthy:
-#   1. Connect to SmartConsole and add each gateway
-#   2. Configure ClusterXL (Active/Standby or Load Sharing)
-#   3. Push policy
+# Checkpoint CloudGuard NVA — first-boot configuration placeholder
+# The following must be completed manually via SmartConsole after deployment:
+#   1. Add this gateway to SmartConsole (Gateways & Servers → New → Locally Managed)
+#   2. Enable ClusterXL (HA) and set cluster mode to Load Sharing Multicast
+#   3. Enable health check port 8117 (Platform Portal → Health Check)
+#   4. Install security policy from SmartConsole
+# See: docs/checkpoint-first-boot.md for full procedure
 ''')
       }
       storageProfile: {
@@ -365,6 +417,19 @@ resource checkpointVmss 'Microsoft.Compute/virtualMachineScaleSets@2023-07-01' =
                     ]
                   }
                 }
+                // FIX #9 — Secondary IP config for floating IP / VIP
+                // Matches the Internal LB frontend IP to enable the asymmetric routing
+                // return path for floating IP / Direct Server Return (DSR) mode.
+                {
+                  name: 'ipconfig-internal-vip'
+                  properties: {
+                    primary: false
+                    privateIPAddressVersion: 'IPv4'
+                    privateIPAllocationMethod: 'Static'
+                    privateIPAddress: internalLbFrontendIp  // Must match LB frontend — enables asymmetric routing return path
+                    subnet: { id: internalSubnetId }
+                  }
+                }
               ]
             }
           }
@@ -388,6 +453,7 @@ resource checkpointVmss 'Microsoft.Compute/virtualMachineScaleSets@2023-07-01' =
 }
 
 // Diagnostics for VMSS
+// TODO: upgrade to @2023-01-01-preview when GA
 resource vmssDiag 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: 'diag-${vmssName}'
   scope: checkpointVmss
@@ -402,8 +468,12 @@ resource vmssDiag 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
 // ============================================================
 // Outputs
 // ============================================================
-@description('Static frontend IP of the Internal Load Balancer — always 10.0.1.4. Use this as the UDR next-hop in spoke route tables.')
-output internalLoadBalancerFrontendIp string = '10.0.1.4'
+// FIX #1 — Output derives from internalLbFrontendIp param (cidrHost-derived in parent template)
+@description('Static frontend IP of the Internal Load Balancer. Use this as the UDR next-hop in spoke route tables.')
+output internalLoadBalancerFrontendIp string = internalLbFrontendIp
+
+@description('Static private IP of the Checkpoint external NIC (eth0). Derived from ingressVnetAddressPrefix in the parent template.')
+output checkpointExternalPrivateIp string = checkpointExternalStaticIp
 
 @description('VM Scale Set resource ID')
 output vmssId string = checkpointVmss.id

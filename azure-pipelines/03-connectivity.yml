@@ -163,6 +163,7 @@ stages:
                 - checkout: self
 
                 - task: AzureCLI@2
+                  timeoutInMinutes: 120
                   displayName: 'Deploy Connectivity Stack (subscription scope)'
                   name: DeployStep
                   inputs:
@@ -173,6 +174,7 @@ stages:
                       set -euo pipefail
 
                       DEPLOY_NAME="alz-connectivity-$(date +%Y%m%d%H%M%S)"
+                      echo "##vso[task.setvariable variable=DEPLOY_NAME]$DEPLOY_NAME"
                       echo "Deployment name: $DEPLOY_NAME"
                       echo "Target subscription: $(CONNECTIVITY_SUBSCRIPTION_ID)"
                       echo "Checkpoint SKU: ${{ parameters.checkpointSku }}"
@@ -214,6 +216,26 @@ stages:
                   inputs:
                     targetPath: connectivity-output.json
                     artifactName: 'connectivity-output-$(Build.BuildNumber)'
+
+                - task: AzureCLI@2
+                  displayName: 'Verify Deployment Health'
+                  timeoutInMinutes: 10
+                  condition: always()
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      STATUS=$(az deployment sub show \
+                        --name "$DEPLOY_NAME" \
+                        --subscription "$(CONNECTIVITY_SUBSCRIPTION_ID)" \
+                        --query 'properties.provisioningState' -o tsv 2>/dev/null || echo "NotFound")
+                      echo "Deployment status: $STATUS"
+                      if [[ "$STATUS" != "Succeeded" ]]; then
+                        echo "##vso[task.logissue type=error]Deployment ended with status: $STATUS. Manual remediation may be required."
+                        echo "##vso[task.complete result=Failed]"
+                      fi
 
                 - bash: |
                     set -euo pipefail

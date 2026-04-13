@@ -11,6 +11,9 @@ param location string = 'australiaeast'
 @description('Hub VNet resource ID for peering')
 param hubVnetId string
 
+@description('Route table resource ID from hub connectivity — forces DC traffic through Checkpoint NVA')
+param hubRouteTableId string
+
 @description('Log Analytics workspace resource ID')
 param logAnalyticsWorkspaceId string
 
@@ -42,7 +45,7 @@ module identityVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
         name: 'snet-domain-controllers'
         addressPrefix: '10.10.0.0/24'
         // Route DC traffic through Checkpoint in hub
-        routeTableResourceId: ''   // Add UDR if needed
+        routeTableResourceId: hubRouteTableId
       }
     ]
     peerings: [

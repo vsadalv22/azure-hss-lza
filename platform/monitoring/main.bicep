@@ -28,6 +28,9 @@ param erCircuitResourceId string
 @description('Checkpoint VM resource ID')
 param checkpointVmResourceId string
 
+@description('Internal Load Balancer resource ID for Checkpoint VMSS — used for health backend count alert')
+param checkpointInternalLbId string = ''
+
 @description('Resource tags')
 param tags object = {
   environment: 'management'
@@ -248,9 +251,49 @@ resource platformWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
 }
 
 // =============================================================
+// Checkpoint VMSS Health — Internal LB Backend Count Alert
+// Fires when fewer than 2 NVA instances are healthy (DipAvailability < 100%)
+// =============================================================
+resource alertCheckpointUnhealthyBackend 'Microsoft.Insights/metricAlerts@2018-03-01' = if (!empty(checkpointInternalLbId)) {
+  name: 'alert-checkpoint-unhealthy-backend-001'
+  location: 'global'
+  tags: tags
+  properties: {
+    description: 'Fires when fewer than 2 Checkpoint VMSS instances are healthy in the internal LB backend pool. Indicates NVA cluster degradation — investigate immediately.'
+    severity: 1   // Critical
+    enabled: true
+    scopes: [checkpointInternalLbId]
+    evaluationFrequency: 'PT1M'
+    windowSize: 'PT5M'
+    targetResourceType: 'Microsoft.Network/loadBalancers'
+    targetResourceRegion: 'australiaeast'
+    criteria: {
+      'odata.type': 'Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria'
+      allOf: [
+        {
+          name: 'HealthyBackendCountLow'
+          metricName: 'DipAvailability'
+          metricNamespace: 'Microsoft.Network/loadBalancers'
+          operator: 'LessThan'
+          threshold: 100   // DipAvailability is a percentage — below 100% means at least one probe failing
+          timeAggregation: 'Average'
+          criterionType: 'StaticThresholdCriterion'
+        }
+      ]
+    }
+    actions: [
+      {
+        actionGroupId: resourceId('Microsoft.Insights/actionGroups', 'ag-platform-ops-001')
+      }
+    ]
+  }
+}
+
+// =============================================================
 // Outputs
 // =============================================================
 output opsActionGroupId string     = agOps.outputs.resourceId
 output secActionGroupId string     = agSec.outputs.resourceId
 output networkWatcherId string     = networkWatcher.id
 output platformWorkbookId string   = platformWorkbook.id
+output checkpointHealthAlertId string = (!empty(checkpointInternalLbId)) ? alertCheckpointUnhealthyBackend.id : ''

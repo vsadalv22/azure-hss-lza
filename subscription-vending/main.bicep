@@ -92,6 +92,13 @@ param enableDefenderSql bool = false
 @description('Enable Defender for Containers')
 param enableDefenderContainers bool = false
 
+// ── DevTest Cost Controls ─────────────────────────────────────
+@description('Enable auto-shutdown schedule for VMs in DevTest subscriptions (cost saving)')
+param enableAutoShutdown bool = false
+
+@description('Auto-shutdown time in HH:MM 24h UTC (e.g. 1900 = 7 PM UTC)')
+param autoShutdownTime string = '1900'
+
 // ── Compliance Tagging ────────────────────────────────────────
 @description('Applicable compliance frameworks (free text)')
 param complianceFrameworks string = 'APRA-CPS234'
@@ -188,46 +195,41 @@ module lzVending 'br/public:avm/ptn/lz/sub-vending:0.4.1' = {
 module defenderServers 'modules/defender-plan.bicep' = if (enableDefenderServers) {
   name: 'defender-servers-${subscriptionAlias}'
   params: {
-    subscriptionId : lzVending.outputs.subscriptionId
-    planName       : 'VirtualMachines'
-    pricingTier    : 'Standard'
-    subPlanName    : 'P2'
+    pricingTierName : 'VirtualMachines'
+    pricingTier     : 'Standard'
+    subPlan         : 'P2'
   }
 }
 
 module defenderStorage 'modules/defender-plan.bicep' = if (enableDefenderStorage) {
   name: 'defender-storage-${subscriptionAlias}'
   params: {
-    subscriptionId : lzVending.outputs.subscriptionId
-    planName       : 'StorageAccounts'
-    pricingTier    : 'Standard'
+    pricingTierName : 'StorageAccounts'
+    pricingTier     : 'Standard'
   }
 }
 
 module defenderKeyVault 'modules/defender-plan.bicep' = if (enableDefenderKeyVault) {
   name: 'defender-kv-${subscriptionAlias}'
   params: {
-    subscriptionId : lzVending.outputs.subscriptionId
-    planName       : 'KeyVaults'
-    pricingTier    : 'Standard'
+    pricingTierName : 'KeyVaults'
+    pricingTier     : 'Standard'
   }
 }
 
 module defenderSql 'modules/defender-plan.bicep' = if (enableDefenderSql) {
   name: 'defender-sql-${subscriptionAlias}'
   params: {
-    subscriptionId : lzVending.outputs.subscriptionId
-    planName       : 'SqlServers'
-    pricingTier    : 'Standard'
+    pricingTierName : 'SqlServers'
+    pricingTier     : 'Standard'
   }
 }
 
 module defenderContainers 'modules/defender-plan.bicep' = if (enableDefenderContainers) {
   name: 'defender-containers-${subscriptionAlias}'
   params: {
-    subscriptionId : lzVending.outputs.subscriptionId
-    planName       : 'Containers'
-    pricingTier    : 'Standard'
+    pricingTierName : 'Containers'
+    pricingTier     : 'Standard'
   }
 }
 
@@ -257,9 +259,37 @@ module subscriptionDiagnostics 'modules/subscription-diagnostics.bicep' = {
 }
 
 // =============================================================
+// 5. Auto-Shutdown Policy — DevTest subscriptions (cost saving)
+//    Uses DINE policy to deploy auto-shutdown schedules on VMs
+// =============================================================
+resource policyAutoShutdownDevTest 'Microsoft.Authorization/policyAssignments@2023-04-01' = if (enableAutoShutdown) {
+  name: 'deploy-vm-auto-shutdown'
+  scope: subscription()
+  identity: {
+    type: 'SystemAssigned'
+  }
+  location: location
+  properties: {
+    displayName: 'DINE — Deploy VM auto-shutdown schedule (DevTest)'
+    description: 'Automatically deploys an auto-shutdown schedule on all VMs. Reduces cost in non-production subscriptions.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/10d41344-6b2c-4885-8b73-c8e32b2f20e7'
+    enforcementMode: 'Default'
+    parameters: {
+      time: { value: autoShutdownTime }
+      timeZone: { value: 'AUS Eastern Standard Time' }
+    }
+  }
+}
+
+// =============================================================
 // Outputs
 // =============================================================
 output subscriptionId string       = lzVending.outputs.subscriptionId
 output spokeVnetResourceId string  = lzVending.outputs.virtualNetworkResourceId
 output subscriptionAlias string    = subscriptionAlias
 output managementGroupId string    = targetManagementGroupId
+
+// Additional outputs for pipeline post-deploy verification and audit
+output networkResourceGroupName string = networkRgName
+output spokeVnetName string = spokeName
+output subscriptionDisplayName string = subscriptionDisplayName

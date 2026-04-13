@@ -13,15 +13,15 @@ targetScope = 'subscription'
 //   DD23 — BGP Active/Active note (see ER Gateway section)
 //   DD34 — DDoS Protection Standard on both VNets
 //
-// VNet layout:
-//   vnet-hub-australiaeast-001     10.0.0.0/16  — egress / hybrid
-//     snet-checkpoint-internal      10.0.1.0/28  — Checkpoint eth1
-//     snet-management               10.0.2.0/24  — jump hosts
-//     GatewaySubnet                 10.0.3.0/27  — ER Gateway
+// VNet layout (default CIDRs — all subnets derived from hubVnetAddressPrefix/ingressVnetAddressPrefix):
+//   vnet-hub-australiaeast-001     hubVnetAddressPrefix (/16)  — egress / hybrid
+//     snet-checkpoint-internal      cidrSubnet(/16, 12, 16)    — Checkpoint eth1 e.g. 10.0.1.0/28
+//     snet-management               cidrSubnet(/16,  8,  2)    — jump hosts       e.g. 10.0.2.0/24
+//     GatewaySubnet                 cidrSubnet(/16, 11, 24)    — ER Gateway        e.g. 10.0.3.0/27
 //
-//   vnet-ingress-australiaeast-001  10.1.0.0/16  — internet-facing / DMZ
-//     snet-checkpoint-external      10.1.0.0/28  — Checkpoint eth0
-//     snet-ingress-dmz              10.1.1.0/24  — DMZ workloads
+//   vnet-ingress-australiaeast-001  ingressVnetAddressPrefix (/16)  — internet-facing / DMZ
+//     snet-checkpoint-external      cidrSubnet(/16, 12,  0)    — Checkpoint eth0  e.g. 10.1.0.0/28
+//     snet-ingress-dmz              cidrSubnet(/16,  8,  1)    — DMZ workloads    e.g. 10.1.1.0/24
 //
 // NOTE — ExpressRoute circuit lifecycle:
 //   The ER circuit itself is created MANUALLY by the network
@@ -72,12 +72,37 @@ param checkpointInstanceCount int = 2
 @allowed(['ErGw1AZ', 'ErGw2AZ', 'ErGw3AZ'])
 param erGatewaySku string = 'ErGw1AZ'
 
+@description('On-premises network CIDR — restricts management subnet NSG inbound rules to on-prem only')
+param onPremAddressSpace string = '10.0.0.0/8'
+
 @description('Resource tags')
 param tags object = {
   environment: 'connectivity'
   managedBy  : 'platform-team'
   createdBy  : 'alz-bicep'
 }
+
+// ── Derived Subnet CIDRs (from hubVnetAddressPrefix) ──────────────────
+// cidrSubnet(prefix, newbits, index) — all derived from /16 base:
+//   hubSubnetExternal : /16 + 12 bits = /28, block 0  → e.g. 10.0.0.0/28
+//   hubSubnetInternal : /16 + 12 bits = /28, block 16 → e.g. 10.0.1.0/28
+//   hubSubnetMgmt     : /16 +  8 bits = /24, block 2  → e.g. 10.0.2.0/24
+//   hubSubnetGateway  : /16 + 11 bits = /27, block 24 → e.g. 10.0.3.0/27
+var hubSubnetExternal  = cidrSubnet(hubVnetAddressPrefix, 12, 0)
+var hubSubnetInternal  = cidrSubnet(hubVnetAddressPrefix, 12, 16)
+var hubSubnetMgmt      = cidrSubnet(hubVnetAddressPrefix, 8,  2)
+var hubSubnetGateway   = cidrSubnet(hubVnetAddressPrefix, 11, 24)
+
+// ── Derived Subnet CIDRs (from ingressVnetAddressPrefix) ──────────────
+//   ingressSubnetExternal: /16 + 12 bits = /28, block 0 → e.g. 10.1.0.0/28
+//   ingressSubnetDmz     : /16 +  8 bits = /24, block 1 → e.g. 10.1.1.0/24
+var ingressSubnetExternal = cidrSubnet(ingressVnetAddressPrefix, 12, 0)
+var ingressSubnetDmz      = cidrSubnet(ingressVnetAddressPrefix, 8,  1)
+
+// ── Derived Static Host IPs ──────────────────────────────────────────
+// Azure reserves .0–.3 in every subnet; first usable host = index 4
+var checkpointInternalIp = cidrHost(hubSubnetInternal, 4)
+var checkpointExternalIp = cidrHost(hubSubnetExternal, 4)
 
 // ============================================================
 // Resource Group
@@ -143,6 +168,7 @@ module erGatewayPip 'br/public:avm/res/network/public-ip-address:0.7.1' = {
 // ============================================================
 
 // NSG for Checkpoint external subnet (now on ingress VNet - DD31)
+// FIX #30 — Added explicit Deny-All-Inbound rule (priority 4096)
 module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0.5.0' = {
   name: 'deploy-nsg-checkpoint-external'
   scope: rg
@@ -184,10 +210,23 @@ module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0
           protocol: 'Tcp'
           access: 'Allow'
           direction: 'Inbound'
-          sourceAddressPrefixes: ['10.0.0.0/8']   // On-prem only
+          sourceAddressPrefixes: [onPremAddressSpace]   // On-prem only
           sourcePortRange: '*'
           destinationAddressPrefix: '*'
           destinationPortRanges: ['18190', '19009', '257', '8211']
+        }
+      }
+      {
+        name: 'Deny-All-Inbound'
+        properties: {
+          priority: 4096
+          protocol: '*'
+          access: 'Deny'
+          direction: 'Inbound'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '*'
         }
       }
     ]
@@ -195,6 +234,7 @@ module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0
   }
 }
 
+// FIX #30 — Added explicit Deny-All-Inbound rule (priority 4096)
 module nsgCheckpointInternal 'br/public:avm/res/network/network-security-group:0.5.0' = {
   name: 'deploy-nsg-checkpoint-internal'
   scope: rg
@@ -202,7 +242,21 @@ module nsgCheckpointInternal 'br/public:avm/res/network/network-security-group:0
     name    : 'nsg-checkpoint-internal-001'
     location: location
     tags    : tags
-    securityRules: []
+    securityRules: [
+      {
+        name: 'Deny-All-Inbound'
+        properties: {
+          priority: 4096
+          protocol: '*'
+          access: 'Deny'
+          direction: 'Inbound'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '*'
+        }
+      }
+    ]
     diagnosticSettings: [{ workspaceResourceId: logAnalyticsWorkspaceId }]
   }
 }
@@ -220,15 +274,72 @@ module nsgIngressDmz 'br/public:avm/res/network/network-security-group:0.5.0' = 
   }
 }
 
+// FIX #8 — NSG for management subnet
+// Management jump hosts require RDP/SSH access from on-premises only.
+// All other inbound traffic is explicitly denied.
+module nsgManagement 'br/public:avm/res/network/network-security-group:0.5.0' = {
+  name: 'deploy-nsg-management'
+  scope: rg
+  params: {
+    name: 'nsg-management-001'
+    location: location
+    tags: tags
+    securityRules: [
+      {
+        name: 'Allow-RDP-from-OnPrem'
+        properties: {
+          priority: 100
+          protocol: 'Tcp'
+          access: 'Allow'
+          direction: 'Inbound'
+          sourceAddressPrefix: onPremAddressSpace
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '3389'
+        }
+      }
+      {
+        name: 'Allow-SSH-from-OnPrem'
+        properties: {
+          priority: 110
+          protocol: 'Tcp'
+          access: 'Allow'
+          direction: 'Inbound'
+          sourceAddressPrefix: onPremAddressSpace
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '22'
+        }
+      }
+      {
+        name: 'Deny-All-Inbound'
+        properties: {
+          priority: 4096
+          protocol: '*'
+          access: 'Deny'
+          direction: 'Inbound'
+          sourceAddressPrefix: '*'
+          sourcePortRange: '*'
+          destinationAddressPrefix: '*'
+          destinationPortRange: '*'
+        }
+      }
+    ]
+    diagnosticSettings: [{ workspaceResourceId: logAnalyticsWorkspaceId }]
+  }
+}
+
 // ============================================================
 // Route Table — force all spoke default traffic via Checkpoint
-// Next-hop 10.0.1.4 = Internal LB frontend IP (VMSS backend)
+// Next-hop = checkpointInternalIp (cidrHost(hubSubnetInternal, 4)) = Internal LB frontend IP (VMSS backend)
+// FIX #23 — Renamed from udr-to-checkpoint-001 to rt-to-checkpoint-hub-001
+//            (rt- prefix aligns with CAF naming convention for route tables)
 // ============================================================
 module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
   name: 'deploy-udr-to-checkpoint'
   scope: rg
   params: {
-    name    : 'udr-to-checkpoint-001'
+    name    : 'rt-to-checkpoint-hub-001'
     location: location
     tags    : tags
     routes  : [
@@ -237,7 +348,7 @@ module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
         properties: {
           addressPrefix   : '0.0.0.0/0'
           nextHopType     : 'VirtualAppliance'
-          nextHopIpAddress: '10.0.1.4'   // Internal LB frontend static IP (VMSS cluster)
+          nextHopIpAddress: checkpointInternalIp   // Internal LB frontend static IP (VMSS cluster)
         }
       }
     ]
@@ -264,21 +375,24 @@ module hubVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
     subnets: [
       {
         // Checkpoint eth1 — internal / trusted. All spoke traffic enters here.
-        // Static IP 10.0.1.4 is assigned to the Internal LB frontend.
+        // Static IP is assigned to the Internal LB frontend (cidrHost(hubSubnetInternal, 4)).
         name                         : 'snet-checkpoint-internal'
-        addressPrefix                : '10.0.1.0/28'
+        addressPrefix                : hubSubnetInternal
         networkSecurityGroupResourceId: nsgCheckpointInternal.outputs.resourceId
       }
       {
         // Management jump hosts — reachable from on-prem via ER (no Bastion)
-        name                : 'snet-management'
-        addressPrefix       : '10.0.2.0/24'
-        routeTableResourceId: routeTableSpoke.outputs.resourceId
+        // FIX #7  — UDR removed: management traffic (Azure platform, diagnostics,
+        //           update services) must NOT be forced through Checkpoint NVA.
+        // FIX #8  — NSG attached: restricts inbound to RDP/SSH from on-prem only.
+        name                          : 'snet-management'
+        addressPrefix                 : hubSubnetMgmt
+        networkSecurityGroupResourceId: nsgManagement.outputs.resourceId
       }
       {
         // Reserved for ExpressRoute Gateway — no NSG or UDR permitted
         name         : 'GatewaySubnet'
-        addressPrefix: '10.0.3.0/27'
+        addressPrefix: hubSubnetGateway
       }
     ]
     diagnosticSettings: [{ workspaceResourceId: logAnalyticsWorkspaceId }]
@@ -306,13 +420,13 @@ module ingressVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
       {
         // Checkpoint eth0 — external / internet-facing (moved from hub VNet - DD31)
         name                         : 'snet-checkpoint-external'
-        addressPrefix                : '10.1.0.0/28'
+        addressPrefix                : ingressSubnetExternal
         networkSecurityGroupResourceId: nsgCheckpointExternal.outputs.resourceId
       }
       {
         // DMZ workloads — internet-facing applications behind Checkpoint
         name                         : 'snet-ingress-dmz'
-        addressPrefix                : '10.1.1.0/24'
+        addressPrefix                : ingressSubnetDmz
         networkSecurityGroupResourceId: nsgIngressDmz.outputs.resourceId
         routeTableResourceId         : routeTableSpoke.outputs.resourceId
       }
@@ -337,6 +451,9 @@ module ingressVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
 }
 
 // VNet peering: hub → ingress (must be a separate resource for gateway transit)
+// FIX #14 — dependsOn [hubVnet, ingressVnet] is explicit here. The remoteVirtualNetwork.id
+//            also references ingressVnet.outputs.resourceId, making the dependency implicit
+//            as well. Both are present for clarity and correctness.
 resource hubToIngressPeering 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2023-09-01' = {
   name: 'vnet-hub-australiaeast-001/peer-hub-to-ingress'
   scope: rg
@@ -374,6 +491,7 @@ resource hubToIngressPeering 'Microsoft.Network/virtualNetworks/virtualNetworkPe
 // 03b-platform-er-connection workflow once the provider has
 // provisioned the circuit.
 // ============================================================
+// FIX #11 — diagnosticSettings verified present and updated to include explicit name
 module erGateway 'br/public:avm/res/network/virtual-network-gateway:0.5.0' = {
   name: 'deploy-er-gateway'
   scope: rg
@@ -385,7 +503,12 @@ module erGateway 'br/public:avm/res/network/virtual-network-gateway:0.5.0' = {
     skuName           : erGatewaySku
     gatewayPipName    : erGatewayPip.outputs.name
     tags              : tags
-    diagnosticSettings: [{ workspaceResourceId: logAnalyticsWorkspaceId }]
+    diagnosticSettings: [
+      {
+        workspaceResourceId: logAnalyticsWorkspaceId
+        name               : 'diag-ergw-hub'
+      }
+    ]
   }
 }
 
@@ -409,10 +532,12 @@ module checkpointVmss './modules/checkpoint-vmss.bicep' = {
     externalSubnetId       : '${ingressVnet.outputs.resourceId}/subnets/snet-checkpoint-external'
     // eth1 — internal NIC in hub VNet
     internalSubnetId       : '${hubVnet.outputs.resourceId}/subnets/snet-checkpoint-internal'
-    externalPublicIpId     : checkpointExternalPip.outputs.resourceId
-    logAnalyticsWorkspaceId: logAnalyticsWorkspaceId
-    instanceCount          : checkpointInstanceCount
-    tags                   : tags
+    externalPublicIpId       : checkpointExternalPip.outputs.resourceId
+    logAnalyticsWorkspaceId  : logAnalyticsWorkspaceId
+    instanceCount            : checkpointInstanceCount
+    internalLbFrontendIp     : checkpointInternalIp
+    checkpointExternalStaticIp: checkpointExternalIp
+    tags                     : tags
   }
 }
 
@@ -423,9 +548,10 @@ output hubVnetId              string = hubVnet.outputs.resourceId
 output hubVnetName            string = hubVnet.outputs.name
 output ingressVnetId          string = ingressVnet.outputs.resourceId
 output ingressVnetName        string = ingressVnet.outputs.name
-output checkpointInternalIp   string = checkpointVmss.outputs.internalLoadBalancerFrontendIp
+output checkpointInternalIp   string = checkpointInternalIp
 output erGatewayId            string = erGateway.outputs.resourceId
 output erGatewayName          string = 'ergw-hub-australiaeast-001'
+// FIX #23 — routeTableId now reflects the renamed rt-to-checkpoint-hub-001 resource
 output routeTableId           string = routeTableSpoke.outputs.resourceId
 output resourceGroupId        string = rg.id
 output ddosProtectionPlanId   string = ddosProtectionPlan.id

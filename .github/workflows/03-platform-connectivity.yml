@@ -59,9 +59,10 @@ jobs:
           az bicep build --file platform/connectivity/modules/checkpoint-nva.bicep
 
   what-if:
-    name: What-If (Dry Run)
+    name: What-If Analysis
     runs-on: ubuntu-latest
     needs: lint
+    environment: platform-production
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +73,10 @@ jobs:
           client-id:       ${{ env.AZURE_CLIENT_ID }}
           subscription-id: ${{ env.CONNECTIVITY_SUBSCRIPTION_ID }}
 
-      - name: What-If — Hub VNet + ER Gateway + Checkpoint
+      - name: Install Bicep
+        run: az bicep install
+
+      - name: What-If — Hub Networking
         run: |
           az deployment sub what-if \
             --name "alz-connectivity-whatif-$(date +%Y%m%d%H%M%S)" \
@@ -84,12 +88,19 @@ jobs:
               logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
               checkpointAdminPassword="${{ env.CHECKPOINT_ADMIN_PASSWORD }}" \
               checkpointSku="${{ github.event.inputs.checkpoint_sku || 'sg-byol' }}" \
-              erGatewaySku="${{ github.event.inputs.er_gateway_sku || 'ErGw1AZ' }}"
+              erGatewaySku="${{ github.event.inputs.er_gateway_sku || 'ErGw1AZ' }}" \
+            2>&1 | tee whatif-output.txt
+
+      - name: Upload What-If Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: connectivity-whatif-${{ github.run_id }}
+          path: whatif-output.txt
 
   deploy:
     name: Deploy Hub VNet + ER Gateway + Checkpoint NVA
     runs-on: ubuntu-latest
-    needs: what-if
+    needs: [lint, what-if]
     environment: platform-production
     outputs:
       hub-vnet-id:    ${{ steps.deploy.outputs.hubVnetId }}
