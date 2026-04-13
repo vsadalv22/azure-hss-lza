@@ -1,0 +1,329 @@
+# ============================================================
+# Pipeline: 06 - Platform: Security
+# Deploys the Platform Key Vault (Premium/HSM), immutable audit
+# storage account (WORM), resource locks, and private endpoints
+# into the Management subscription.
+#
+# Compliance: APRA CPS 234, Australian ISM, Essential Eight ML2
+#
+# Trigger: changes to platform/security/**  on main
+# Manual:  Run pipeline button in ADO
+#
+# Deployment order:
+#   01-management-groups → 02-logging → 03-connectivity → THIS
+#
+# Prerequisites (variable group: alz-platform-secrets):
+#   LOG_ANALYTICS_WORKSPACE_ID  — set after pipeline 02-logging runs
+#   HUB_VNET_ID                 — set after pipeline 03-connectivity runs
+#   MANAGEMENT_SUBNET_ID        — set after pipeline 03-connectivity runs
+#   LAW_MI_PRINCIPAL_ID         — set after pipeline 02-logging runs
+#                                 (lawManagedIdentityPrincipalId output)
+#
+# Post-deploy actions performed by this pipeline:
+#   1. Output Key Vault ID and URI as pipeline variables
+#   2. Grant 'Key Vault Crypto User' to the LAW managed identity
+#      so pipeline 02-logging can be re-run to activate CMK.
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - platform/security/**
+
+pr: none   # PRs to non-main branches must NOT trigger production pipelines
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: alz-platform-secrets     # AZURE_TENANT_ID, AZURE_CLIENT_ID, MANAGEMENT_SUBSCRIPTION_ID
+                                    # LOG_ANALYTICS_WORKSPACE_ID, HUB_VNET_ID, MANAGEMENT_SUBNET_ID
+                                    # LAW_MI_PRINCIPAL_ID
+  - group: alz-platform-variables   # Non-secret config values
+
+# ============================================================
+# STAGE 1 — LINT (automated)
+# ============================================================
+stages:
+  - stage: Lint
+    displayName: 'Stage 1 — Bicep Lint'
+    jobs:
+      - job: BicepLint
+        displayName: 'Bicep Lint — Security'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'Lint platform/security/main.bicep'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Running bicep build (lint) on security main template..."
+                az bicep build --file platform/security/main.bicep
+                echo ""
+                echo "Linting sub-modules..."
+                az bicep build --file platform/security/modules/resource-lock.bicep
+                az bicep build --file platform/security/modules/private-endpoint.bicep
+                echo ""
+                echo "All lint checks passed — no errors found."
+
+  # ============================================================
+  # STAGE 2 — WHAT-IF (automated, depends on Lint)
+  # ============================================================
+  - stage: WhatIf
+    displayName: 'Stage 2 — What-If (Dry Run)'
+    dependsOn: Lint
+    condition: succeeded('Lint')
+    jobs:
+      - job: WhatIfDeployment
+        displayName: 'What-If — Subscription Deployment'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'What-If — Security Stack'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                DEPLOY_NAME="alz-security-whatif-$(date +%Y%m%d%H%M%S)"
+                echo "Running what-if: $DEPLOY_NAME"
+                echo "Target subscription: $(MANAGEMENT_SUBSCRIPTION_ID)"
+
+                az deployment sub what-if \
+                  --name "$DEPLOY_NAME" \
+                  --location australiaeast \
+                  --subscription "$(MANAGEMENT_SUBSCRIPTION_ID)" \
+                  --template-file platform/security/main.bicep \
+                  --parameters \
+                      logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                      hubVnetId="$(HUB_VNET_ID)" \
+                      managementSubnetId="$(MANAGEMENT_SUBNET_ID)" \
+                      enableResourceLocks=true \
+                  2>&1 | tee whatif-output.txt
+
+                echo ""
+                echo "What-if complete. Review the above output before approving deployment."
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish What-If output'
+            condition: always()
+            inputs:
+              targetPath: whatif-output.txt
+              artifactName: 'whatif-security-$(Build.BuildNumber)'
+
+  # ============================================================
+  # STAGE 3 — APPROVAL GATE
+  # Manual approval required from Platform Architecture Board
+  # before any security infrastructure is created or changed.
+  # ============================================================
+  - stage: Approval
+    displayName: 'Stage 3 — Approval Gate'
+    dependsOn: WhatIf
+    condition: succeeded('WhatIf')
+    jobs:
+      - deployment: ApprovalGate
+        displayName: 'Awaiting Platform Architecture Board Approval'
+        environment: platform-production   # Configure approval checks in ADO Environments
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - bash: |
+                    echo "============================================================"
+                    echo "APPROVAL GRANTED — proceeding to Stage 4: Deploy"
+                    echo "Approver: $(Build.RequestedFor)"
+                    echo "Build   : $(Build.BuildNumber)"
+                    echo "Branch  : $(Build.SourceBranch)"
+                    echo "============================================================"
+                  displayName: 'Log approval details'
+
+  # ============================================================
+  # STAGE 4 — DEPLOY (depends on Approval)
+  # ============================================================
+  - stage: Deploy
+    displayName: 'Stage 4 — Deploy Security Stack'
+    dependsOn: Approval
+    condition: succeeded('Approval')
+    jobs:
+      - deployment: DeploySecurity
+        displayName: 'Deploy — Platform Key Vault, Immutable Storage & Locks'
+        environment: platform-production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                # --------------------------------------------------
+                # 4a. Deploy security stack
+                # --------------------------------------------------
+                - task: AzureCLI@2
+                  displayName: 'Deploy Security Stack (subscription scope)'
+                  name: DeployStep
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      DEPLOY_NAME="alz-security-$(date +%Y%m%d%H%M%S)"
+                      echo "Deployment name : $DEPLOY_NAME"
+                      echo "Target sub      : $(MANAGEMENT_SUBSCRIPTION_ID)"
+
+                      OUTPUT=$(az deployment sub create \
+                        --name "$DEPLOY_NAME" \
+                        --location australiaeast \
+                        --subscription "$(MANAGEMENT_SUBSCRIPTION_ID)" \
+                        --template-file platform/security/main.bicep \
+                        --parameters \
+                            logAnalyticsWorkspaceId="$(LOG_ANALYTICS_WORKSPACE_ID)" \
+                            hubVnetId="$(HUB_VNET_ID)" \
+                            managementSubnetId="$(MANAGEMENT_SUBNET_ID)" \
+                            enableResourceLocks=true \
+                        --output json)
+
+                      echo "$OUTPUT" | tee deployment-output.json
+
+                      # ---- Extract outputs ----
+                      KV_ID=$(echo "$OUTPUT"   | jq -r '.properties.outputs.keyVaultId.value          // empty')
+                      KV_NAME=$(echo "$OUTPUT" | jq -r '.properties.outputs.keyVaultName.value        // empty')
+                      KV_URI=$(echo "$OUTPUT"  | jq -r '.properties.outputs.keyVaultUri.value         // empty')
+                      ST_ID=$(echo "$OUTPUT"   | jq -r '.properties.outputs.immutableStorageAccountId.value // empty')
+                      RG_ID=$(echo "$OUTPUT"   | jq -r '.properties.outputs.securityResourceGroupId.value   // empty')
+
+                      echo ""
+                      echo "##[section]Deployment outputs:"
+                      echo "  Key Vault ID      : $KV_ID"
+                      echo "  Key Vault Name    : $KV_NAME"
+                      echo "  Key Vault URI     : $KV_URI"
+                      echo "  Immutable Stor ID : $ST_ID"
+                      echo "  Security RG ID    : $RG_ID"
+
+                      # ---- Surface as pipeline output variables ----
+                      if [ -n "$KV_ID" ]; then
+                        echo "##vso[task.setvariable variable=kvResourceId;isOutput=true]$KV_ID"
+                      fi
+                      if [ -n "$KV_URI" ]; then
+                        echo "##vso[task.setvariable variable=kvUri;isOutput=true]$KV_URI"
+                      fi
+                      if [ -n "$ST_ID" ]; then
+                        echo "##vso[task.setvariable variable=immutableStorageId;isOutput=true]$ST_ID"
+                      fi
+
+                      echo ""
+                      echo "IMPORTANT: Update the alz-platform-secrets variable group with:"
+                      echo "  KV_RESOURCE_ID             = $KV_ID"
+                      echo "  KV_URI                     = $KV_URI"
+                      echo "  IMMUTABLE_STORAGE_ACCOUNT_ID = $ST_ID"
+
+                # --------------------------------------------------
+                # 4b. Grant Key Vault Crypto User to LAW MI
+                #     Enables pipeline 02-logging to be re-run with
+                #     CMK enabled (keyVaultResourceId param populated).
+                # --------------------------------------------------
+                - task: AzureCLI@2
+                  displayName: 'Grant Key Vault Crypto User — LAW Managed Identity'
+                  name: GrantKvCryptoUser
+                  inputs:
+                    azureSubscription: 'hss-platform-azure-sc'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      KV_RESOURCE_ID="$(DeployStep.kvResourceId)"
+
+                      if [ -z "$(LAW_MI_PRINCIPAL_ID)" ]; then
+                        echo "##[warning]LAW_MI_PRINCIPAL_ID is not set in variable group alz-platform-secrets."
+                        echo "  Run pipeline 02-logging first to create the managed identity,"
+                        echo "  then populate LAW_MI_PRINCIPAL_ID with the lawManagedIdentityPrincipalId output."
+                        echo "  Re-run this stage manually once the variable is set."
+                        exit 0
+                      fi
+
+                      if [ -z "$KV_RESOURCE_ID" ]; then
+                        echo "##[error]KV_RESOURCE_ID is empty — deployment output not captured correctly."
+                        exit 1
+                      fi
+
+                      echo "Granting 'Key Vault Crypto User' to principal: $(LAW_MI_PRINCIPAL_ID)"
+                      echo "Scope: $KV_RESOURCE_ID"
+
+                      az role assignment create \
+                        --assignee-object-id "$(LAW_MI_PRINCIPAL_ID)" \
+                        --assignee-principal-type ServicePrincipal \
+                        --role "Key Vault Crypto User" \
+                        --scope "$KV_RESOURCE_ID"
+
+                      echo ""
+                      echo "Role assignment complete."
+                      echo "Next: re-run pipeline 02-logging with:"
+                      echo "  keyVaultResourceId    = $KV_RESOURCE_ID"
+                      echo "  immutableStorageAccountId = $(DeployStep.immutableStorageId)"
+
+                # --------------------------------------------------
+                # 4c. Publish deployment artefact
+                # --------------------------------------------------
+                - task: PublishPipelineArtifact@1
+                  displayName: 'Publish deployment output'
+                  condition: always()
+                  inputs:
+                    targetPath: deployment-output.json
+                    artifactName: 'security-output-$(Build.BuildNumber)'
+
+                # --------------------------------------------------
+                # 4d. Post-deploy summary
+                # --------------------------------------------------
+                - bash: |
+                    cat << 'SUMMARY'
+                    ============================================================
+                    Platform Security Stack Deployed Successfully
+                    ============================================================
+                    Subscription : Management subscription
+                    Location     : australiaeast
+                    Scope        : Subscription
+
+                    Resources deployed:
+                      • Key Vault (Premium/HSM) — kv-platform-sec-aue-001
+                      • Immutable Storage Account (Standard_GRS, WORM 365 days)
+                      • Resource lock (CanNotDelete) on rg-security-platform-001
+                      • Private endpoints in management subnet
+
+                    ACTIONS REQUIRED:
+                    1. Update 'alz-platform-secrets' variable group in ADO Library:
+                         KV_RESOURCE_ID               = <from deployment output>
+                         KV_URI                       = <from deployment output>
+                         IMMUTABLE_STORAGE_ACCOUNT_ID = <from deployment output>
+
+                    2. Create Key Vault secrets MANUALLY (do NOT put in pipeline vars):
+                         checkpoint-admin-password  — Checkpoint NVA admin password
+                         automation-account-key     — Automation webhook key (if needed)
+                       Grant 'Key Vault Secrets User' role to relevant managed identities.
+
+                    3. Re-run pipeline 02-logging to activate:
+                         - Customer-Managed Key (CMK) encryption on Log Analytics
+                         - WORM data export to immutable storage
+
+                    Compliance: APRA CPS 234 | Australian ISM | Essential Eight ML2
+                    SUMMARY
+                  displayName: 'Post-deploy summary'

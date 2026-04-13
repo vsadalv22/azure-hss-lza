@@ -13,6 +13,7 @@ targetScope = 'subscription'
   'Arm'
   'OpenSourceRelationalDatabases'
   'CosmosDbs'
+  'CloudPosture'
 ])
 param pricingTierName string
 

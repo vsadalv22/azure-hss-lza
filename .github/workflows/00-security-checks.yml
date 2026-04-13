@@ -1,0 +1,110 @@
+# ============================================================
+# Security Checks — runs on every PR and push to main
+# Checks:
+#   1. Bicep lint (az bicep lint)
+#   2. Checkov static analysis (IaC security scanner)
+#   3. Secret scanning (Gitleaks)
+#   4. Bicep build validation (ARM template output)
+# ============================================================
+name: '00 — Security Checks'
+
+on:
+  pull_request:
+    branches: [main, staging]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write  # Required for Checkov SARIF upload
+  pull-requests: read
+
+env:
+  AZURE_TENANT_ID:  ${{ vars.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID:  ${{ vars.AZURE_CLIENT_ID }}
+
+jobs:
+  bicep-lint:
+    name: Bicep Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Bicep
+        run: az bicep install
+
+      - name: Lint all Bicep files
+        run: |
+          FAILED=0
+          while IFS= read -r -d '' file; do
+            echo "Linting: $file"
+            if ! az bicep lint --file "$file" 2>&1; then
+              echo "::error file=$file::Bicep lint failed"
+              FAILED=1
+            fi
+          done < <(find . -name "*.bicep" -not -path "./.git/*" -print0)
+          exit $FAILED
+
+  checkov-scan:
+    name: Checkov IaC Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: bicep
+          output_format: sarif
+          output_file_path: results.sarif
+          soft_fail: false
+          skip_check: >-
+            CKV_AZURE_131,
+            CKV_AZURE_35
+          # CKV_AZURE_131: Key Vault firewall — we use private endpoints + network ACLs
+          # CKV_AZURE_35:  Storage account network rules — managed via private endpoints
+
+      - name: Upload Checkov SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: checkov-bicep
+
+  gitleaks-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  bicep-build-validate:
+    name: Bicep Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bicep
+        run: az bicep install
+
+      - name: Build all Bicep files (ARM template output validation)
+        run: |
+          FAILED=0
+          while IFS= read -r -d '' file; do
+            echo "Building: $file"
+            if ! az bicep build --file "$file" --outdir /tmp/bicep-build/ 2>&1; then
+              echo "::error file=$file::Bicep build failed"
+              FAILED=1
+            fi
+          done < <(find . -name "*.bicep" -not -path "./.git/*" -print0)
+          exit $FAILED

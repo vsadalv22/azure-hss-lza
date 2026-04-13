@@ -395,9 +395,126 @@ resource policyRequireHspIdTag 'Microsoft.Authorization/policyAssignments@2023-0
 }
 
 // =============================================================
+// Security — Enforce TLS 1.2 minimum on storage accounts
+// =============================================================
+resource policyStorageTls 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'enforce-storage-tls12'
+  scope: managementGroup()
+  properties: {
+    displayName: 'DENY — Storage accounts below TLS 1.2'
+    description: 'Ensures all storage accounts enforce a minimum of TLS 1.2 for data in transit. ISM Control 1139.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/fe83a0eb-a853-422d-aac2-1bffd182c5d0'
+    enforcementMode: 'Default'
+    parameters: {
+      minimumTlsVersion: { value: 'TLS1_2' }
+    }
+  }
+}
+
+// =============================================================
+// Security — Deny storage accounts with public blob access
+// =============================================================
+resource policyDenyPublicBlob 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'deny-public-blob-access'
+  scope: managementGroup()
+  properties: {
+    displayName: 'DENY — Public blob access on storage accounts'
+    description: 'Prevents enabling anonymous public read access on blob containers.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/4fa4b6c0-31ca-4c0d-b10d-24b96f62a751'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// =============================================================
+// Security — Require secure transfer on storage accounts
+// =============================================================
+resource policySecureTransfer 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'require-secure-transfer-storage'
+  scope: managementGroup()
+  properties: {
+    displayName: 'DENY — Storage accounts without secure transfer'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/404c3081-a854-4457-ae30-26a93ef643f9'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// =============================================================
+// Security — Audit VMs not using managed disks (already exists — skip)
+// =============================================================
+
+// =============================================================
+// Security — Enforce Key Vault purge protection
+// =============================================================
+resource policyKvPurgeProtection 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'require-kv-purge-protection'
+  scope: managementGroup()
+  properties: {
+    displayName: 'DENY — Key Vaults without purge protection'
+    description: 'Key Vault purge protection prevents permanent deletion during retention period. Essential Eight ML2.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/0b60c0b2-2dc2-4e1c-b5c9-abbed971de53'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// =============================================================
+// Security — Deploy Azure Monitor Dependency Agent (DINE)
+// =============================================================
+resource policyMonitoringAgent 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'deploy-monitoring-agent'
+  scope: managementGroup()
+  identity: {
+    type: 'SystemAssigned'
+  }
+  location: location
+  properties: {
+    displayName: 'DINE — Deploy Azure Monitor Agent to VMs'
+    description: 'Deploys Azure Monitor Agent (AMA) to all VMs for log collection. Replaces legacy MMA agent.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/d367bd60-64ca-4364-98ea-276775bddd94'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// =============================================================
+// Security — Enforce Private Endpoints for Key Vault (AUDIT)
+// =============================================================
+resource policyKvPrivateEndpoint 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'audit-kv-private-endpoint'
+  scope: managementGroup()
+  properties: {
+    displayName: 'AUDIT — Key Vaults should use private endpoints'
+    description: 'Audits Key Vaults not using private endpoints. Public access should be disabled for enterprise KVs.'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/a6abeaec-4d90-4a02-805f-6b26c4d3fbe9'
+    enforcementMode: 'DoNotEnforce'
+    parameters: {}
+  }
+}
+
+// =============================================================
+// Security — Microsoft Defender for Cloud — Enable auto-provisioning
+// =============================================================
+resource policyDefenderContainers 'Microsoft.Authorization/policyAssignments@2023-04-01' = {
+  name: 'deploy-defender-containers'
+  scope: managementGroup()
+  identity: {
+    type: 'SystemAssigned'
+  }
+  location: location
+  properties: {
+    displayName: 'DINE — Enable Defender for Containers'
+    policyDefinitionId: '/providers/Microsoft.Authorization/policyDefinitions/c9ddb292-b203-4738-aead-18e2716f6afa'
+    enforcementMode: 'Default'
+    parameters: {}
+  }
+}
+
+// =============================================================
 // Outputs
 // =============================================================
-// Root-level assignments: 15 (unchanged)
+// Root-level assignments: 15 base + 7 new security = 22
 // Sub-scope assignments (DD36): 3 (Connectivity x1, LandingZones x2)
-// Total: 18
-output policyAssignmentCount int = 18
+// Total: 25
+output policyAssignmentCount int = 25

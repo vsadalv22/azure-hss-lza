@@ -92,6 +92,12 @@ param enableDefenderSql bool = false
 @description('Enable Defender for Containers')
 param enableDefenderContainers bool = false
 
+@description('Apply CanNotDelete lock to the new subscription. EA subscription deletion is irreversible.')
+param enableSubscriptionLock bool = true
+
+@description('Security contact email for Defender for Cloud alerts on the new subscription')
+param securityContactEmail string = ''
+
 // ── DevTest Cost Controls ─────────────────────────────────────
 @description('Enable auto-shutdown schedule for VMs in DevTest subscriptions (cost saving)')
 param enableAutoShutdown bool = false
@@ -230,6 +236,46 @@ module defenderContainers 'modules/defender-plan.bicep' = if (enableDefenderCont
   params: {
     pricingTierName : 'Containers'
     pricingTier     : 'Standard'
+  }
+}
+
+// ── Subscription-level Lock (CanNotDelete) ─────────────────────────
+// EA subscription deletion is irreversible — lock prevents accidents
+module subLock 'modules/subscription-lock.bicep' = if (enableSubscriptionLock) {
+  name: 'deploy-subscription-lock'
+  scope: subscription(lzVending.outputs.subscriptionId)
+  params: {
+    lockName: 'lock-${subscriptionAlias}-cannotdelete'
+    notes: 'EA subscription ${subscriptionAlias} — created via HSS LZ vending machine. Deletion requires PAB approval.'
+  }
+  dependsOn: [lzVending]
+}
+
+// ── Defender CSPM (Cloud Security Posture Management) ──────────────
+module defenderCspm 'modules/defender-plan.bicep' = {
+  name: 'deploy-defender-cspm'
+  scope: subscription(lzVending.outputs.subscriptionId)
+  params: {
+    pricingTierName: 'CloudPosture'
+    pricingTier: 'Standard'
+  }
+  dependsOn: [lzVending]
+}
+
+// ── Defender for Cloud Security Contact ────────────────────────────
+resource securityContact 'Microsoft.Security/securityContacts@2023-12-01-preview' = if (!empty(securityContactEmail)) {
+  name: 'default'
+  properties: {
+    emails: securityContactEmail
+    isEnabled: true
+    notificationsByRole: {
+      state: 'On'
+      roles: ['Owner', 'Contributor']
+    }
+    alertNotifications: {
+      state: 'On'
+      minimalSeverity: 'High'
+    }
   }
 }
 

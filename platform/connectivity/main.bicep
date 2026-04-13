@@ -82,6 +82,9 @@ param tags object = {
   createdBy  : 'alz-bicep'
 }
 
+@description('Apply CanNotDelete resource lock to the hub connectivity resource group. Prevents accidental deletion of the hub VNet, ER Gateway, and Checkpoint VMSS.')
+param enableResourceLocks bool = true
+
 // ── Derived Subnet CIDRs (from hubVnetAddressPrefix) ──────────────────
 // cidrSubnet(prefix, newbits, index) — all derived from /16 base:
 //   hubSubnetExternal : /16 + 12 bits = /28, block 0  → e.g. 10.0.0.0/28
@@ -558,3 +561,20 @@ output ddosProtectionPlanId   string = ddosProtectionPlan.id
 // NOTE: erCircuitId is NOT output here — the circuit is created manually.
 // After manual creation, copy the circuit resource ID and use it in
 // the 03b-platform-er-connection workflow.
+
+// ============================================================
+// Resource Lock — Hub Connectivity (CanNotDelete)
+// Protects the hub VNet, ER Gateway, Checkpoint VMSS, and all
+// associated networking resources from accidental deletion.
+// ============================================================
+resource hubConnectivityLock 'Microsoft.Authorization/locks@2020-05-01' = if (enableResourceLocks) {
+  name: 'lock-hub-connectivity-cannotdelete'
+  scope: rg
+  properties: {
+    level: 'CanNotDelete'
+    notes: 'Hub connectivity resources — deletion requires Platform Architecture Board approval. Raise an RFC before removing this lock.'
+  }
+  dependsOn: [hubVnet, ingressVnet, erGateway, checkpointVmss]
+}
+
+output resourceLockId string = enableResourceLocks ? hubConnectivityLock.id : ''

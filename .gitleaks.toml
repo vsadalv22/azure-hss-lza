@@ -1,0 +1,65 @@
+# =============================================================
+# Gitleaks Configuration — WA Health HSS Azure Landing Zone
+# Detects secrets accidentally committed to the repository
+# Ref: https://github.com/gitleaks/gitleaks
+# =============================================================
+
+title = "WA Health HSS ALZ — Gitleaks Secret Detection"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "azure-client-secret"
+description = "Azure Service Principal Client Secret"
+regex = '''(?i)(client[_\-\.]?secret)\s*[=:]\s*["']?[A-Za-z0-9~._\-]{34,}["']?'''
+tags = ["azure", "secret", "credential"]
+
+[[rules]]
+id = "azure-storage-connection-string"
+description = "Azure Storage Account Connection String"
+regex = '''DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{86,88}'''
+tags = ["azure", "storage", "secret"]
+
+[[rules]]
+id = "azure-sas-token"
+description = "Azure SAS Token"
+regex = '''(?:sv|st|se|spr|sip|si|srt|ss|sp)=[^&\s]{1,200}&sig=[A-Za-z0-9%+/=]{43,}'''
+tags = ["azure", "sas", "token"]
+
+[[rules]]
+id = "azure-subscription-key"
+description = "Azure API Management Subscription Key"
+regex = '''(?i)(ocp-apim-subscription-key|subscription[_\-]?key)\s*[=:]\s*["']?[a-f0-9]{32}["']?'''
+tags = ["azure", "apim", "secret"]
+
+[[rules]]
+id = "checkpoint-admin-password"
+description = "Checkpoint CloudGuard admin password in config"
+regex = '''(?i)(checkpoint[_\-\.]?admin[_\-\.]?password|checkpointPassword)\s*[=:]\s*["'][^"']{8,}["']'''
+tags = ["checkpoint", "password", "nva"]
+
+[[rules]]
+id = "bicep-secure-param-value"
+description = "Bicep @secure() parameter with a hardcoded value in bicepparam file"
+regex = '''param\s+\w*[Pp]assword\w*\s*=\s*["'][^'"]{6,}["']'''
+tags = ["bicep", "password", "iac"]
+
+[allowlist]
+description = "Global allowlist — safe patterns that should not alert"
+paths = [
+  '''.git/''',
+  '''docs/''',
+  '''.*\.md$''',
+]
+regexes = [
+  # Key Vault URI references are not secrets
+  '''https://[a-z0-9\-]+\.vault\.azure\.net''',
+  # Empty placeholder values in bicepparam files
+  '''=\s*''["']{2}''',
+  # Azure resource IDs are not secrets
+  '''/subscriptions/[0-9a-f\-]{36}/''',
+  # Comments referencing secret names
+  '''#.*password''',
+  '''\/\/.*password''',
+]

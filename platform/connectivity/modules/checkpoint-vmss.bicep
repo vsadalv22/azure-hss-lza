@@ -106,6 +106,27 @@ resource bootDiagStorageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' =
   sku: { name: 'Standard_LRS' }
   kind: 'StorageV2'
   tags: tags
+  properties: {
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: true  // Required for boot diagnostics writes
+    networkAcls: {
+      defaultAction: 'Deny'
+      bypass: 'AzureServices'   // Allows Azure Diagnostics service to write
+      ipRules: []
+      virtualNetworkRules: []
+    }
+    encryption: {
+      services: {
+        blob: {
+          enabled: true
+          keyType: 'Account'
+        }
+      }
+      keySource: 'Microsoft.Storage'
+    }
+  }
 }
 
 // ============================================================

@@ -1,0 +1,156 @@
+# ============================================================
+# Security Checks Pipeline — Azure DevOps
+# Runs: Bicep lint + Checkov SAST + Gitleaks secret scan
+# Trigger: every PR to main and push to main/staging/prod
+# ============================================================
+name: '00 — Security Checks'
+
+trigger:
+  branches:
+    include:
+      - main
+      - staging
+      - prod
+  paths:
+    include:
+      - '**/*.bicep'
+      - '**/*.bicepparam'
+      - 'azure-pipelines/**'
+      - '.github/workflows/**'
+
+pr:
+  branches:
+    include:
+      - main
+      - staging
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: BicepLint
+    displayName: 'Bicep Lint'
+    jobs:
+      - job: LintAllFiles
+        displayName: 'Lint all Bicep files'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: az bicep install
+
+          - task: AzureCLI@2
+            displayName: 'Lint all .bicep files'
+            timeoutInMinutes: 15
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                FAILED=0
+                while IFS= read -r -d '' file; do
+                  echo "Linting: $file"
+                  if ! az bicep lint --file "$file" 2>&1; then
+                    echo "##vso[task.logissue type=error]Lint failed: $file"
+                    FAILED=1
+                  fi
+                done < <(find . -name "*.bicep" -not -path "./.git/*" -print0)
+                exit $FAILED
+
+  - stage: CheckovScan
+    displayName: 'Checkov SAST'
+    dependsOn: BicepLint
+    jobs:
+      - job: CheckovIaC
+        displayName: 'Checkov IaC Security Scan'
+        steps:
+          - checkout: self
+
+          - script: |
+              set -euo pipefail
+              pip install checkov
+              checkov --directory . \
+                --framework bicep \
+                --output sarif \
+                --output-file-path checkov-results.sarif \
+                --skip-check CKV_AZURE_131,CKV_AZURE_35 \
+                --soft-fail
+            displayName: 'Run Checkov'
+            timeoutInMinutes: 20
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Checkov SARIF'
+            condition: always()
+            inputs:
+              pathToPublish: 'checkov-results.sarif'
+              artifactName: 'checkov-sarif'
+
+  - stage: GitleaksScan
+    displayName: 'Secret Scanning'
+    dependsOn: []  # Run in parallel with BicepLint
+    jobs:
+      - job: GitleaksScan
+        displayName: 'Gitleaks Secret Detection'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              set -euo pipefail
+              # Download gitleaks
+              curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz \
+                | tar xz -C /usr/local/bin gitleaks
+              chmod +x /usr/local/bin/gitleaks
+              # Run scan
+              gitleaks detect \
+                --source . \
+                --log-opts="--all" \
+                --report-format sarif \
+                --report-path gitleaks-report.sarif \
+                --verbose
+            displayName: 'Run Gitleaks secret scan'
+            timeoutInMinutes: 10
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Gitleaks report'
+            condition: always()
+            inputs:
+              pathToPublish: 'gitleaks-report.sarif'
+              artifactName: 'gitleaks-report'
+
+  - stage: BicepBuildValidation
+    displayName: 'Build Validation'
+    dependsOn: BicepLint
+    jobs:
+      - job: BuildAll
+        displayName: 'Build all Bicep to ARM JSON'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'az bicep build — all files'
+            timeoutInMinutes: 15
+            inputs:
+              azureSubscription: 'hss-platform-azure-sc'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                az bicep install
+                mkdir -p /tmp/bicep-build
+                FAILED=0
+                while IFS= read -r -d '' file; do
+                  echo "Building: $file"
+                  if ! az bicep build --file "$file" --outdir /tmp/bicep-build/ 2>&1; then
+                    echo "##vso[task.logissue type=error]Build failed: $file"
+                    FAILED=1
+                  fi
+                done < <(find . -name "*.bicep" -not -path "./.git/*" -print0)
+                exit $FAILED

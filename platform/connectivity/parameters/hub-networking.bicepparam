@@ -54,3 +54,6 @@ param tags = {
   createdBy  : 'alz-bicep'
   costCenter : 'platform'
 }
+
+// Set to false only during initial development/testing — always true in production
+param enableResourceLocks = true

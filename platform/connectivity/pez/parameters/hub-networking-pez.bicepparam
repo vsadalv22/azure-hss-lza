@@ -48,3 +48,5 @@ param tags = {
   createdBy   : 'alz-bicep'
   costCenter  : 'platform'
 }
+
+param enableResourceLocks = true
