@@ -74,7 +74,7 @@ jobs:
               logAnalyticsWorkspaceId="${{ env.LOG_ANALYTICS_WORKSPACE_ID }}" \
               securityContactEmail="${{ env.SENTINEL_SECURITY_CONTACT }}" \
             --output json | tee policy-output.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: policy-output
           path: policy-output.json

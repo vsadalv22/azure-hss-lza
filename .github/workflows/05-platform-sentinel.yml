@@ -84,7 +84,7 @@ jobs:
             Complete watchlist population and TAXII feed configuration in the Sentinel portal."
 
       - name: Upload Output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sentinel-output
           path: sentinel-output.json

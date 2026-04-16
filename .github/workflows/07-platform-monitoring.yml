@@ -85,7 +85,7 @@ jobs:
               erCircuitResourceId="${{ env.ER_CIRCUIT_RESOURCE_ID }}" \
               checkpointVmResourceId="${{ env.CHECKPOINT_VM_RESOURCE_ID }}" \
             --output json | tee monitoring-output.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: monitoring-output
           path: monitoring-output.json
