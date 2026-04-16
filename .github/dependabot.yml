@@ -1,0 +1,41 @@
+# =============================================================
+# Dependabot Configuration — WA Health HSS Azure Landing Zone
+# Automatically raises PRs when GitHub Actions or Docker
+# versions used in workflows become outdated.
+# NOTE: AVM Bicep module versions are tracked separately in
+#       docs/avm-module-versions.md — update manually via PR.
+# =============================================================
+version: 2
+
+updates:
+  # GitHub Actions — keeps workflow action versions current
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Australia/Perth"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "vsadalv22"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      actions-minor:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Docker — for any container images used in workflows
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"

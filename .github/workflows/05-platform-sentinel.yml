@@ -7,6 +7,10 @@ on:
       - 'platform/sentinel/**'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel in-progress infra deployments — too risky
+
 permissions:
   id-token: write
   contents: read

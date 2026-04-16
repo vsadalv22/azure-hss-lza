@@ -41,10 +41,12 @@ targetScope = 'subscription'
 @description('Azure region')
 param location string = 'australiaeast'
 
-@description('Hub VNet address space (egress / hybrid VNet)')
+@description('Hub VNet address prefix (RFC1918 /16 recommended)')
+@pattern('^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)[0-9.]+/[0-9]{1,2}$')
 param hubVnetAddressPrefix string = '10.0.0.0/16'
 
-@description('Ingress VNet address space (internet-facing / DMZ VNet - DD31)')
+@description('Ingress VNet address prefix (must not overlap with hub)')
+@pattern('^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)[0-9.]+/[0-9]{1,2}$')
 param ingressVnetAddressPrefix string = '10.1.0.0/16'
 
 @description('Log Analytics workspace resource ID for diagnostics')
@@ -72,7 +74,8 @@ param checkpointInstanceCount int = 2
 @allowed(['ErGw1AZ', 'ErGw2AZ', 'ErGw3AZ'])
 param erGatewaySku string = 'ErGw1AZ'
 
-@description('On-premises network CIDR — restricts management subnet NSG inbound rules to on-prem only')
+@description('On-premises address space for NSG allow rules')
+@pattern('^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)[0-9.]+/[0-9]{1,2}$')
 param onPremAddressSpace string = '10.0.0.0/8'
 
 @description('Resource tags')
@@ -84,6 +87,18 @@ param tags object = {
 
 @description('Apply CanNotDelete resource lock to the hub connectivity resource group. Prevents accidental deletion of the hub VNet, ER Gateway, and Checkpoint VMSS.')
 param enableResourceLocks bool = true
+
+@description('Deploy Private DNS zones for PaaS services. Required when workloads use private endpoints.')
+param deployPrivateDnsZones bool = true
+
+// ── Effective Tags — merges caller-supplied tags with mandatory platform tags ──
+// Mandatory tags are always applied regardless of what the caller passes.
+// This ensures compliance with the require-tags-on-rg policy (GOV-02).
+var effectiveTags = union(tags, {
+  managedBy : 'platform-team'
+  createdBy : 'alz-bicep'
+  deployedAt: utcNow('yyyy-MM-dd')   // Deployment timestamp for audit trail
+})
 
 // ── Derived Subnet CIDRs (from hubVnetAddressPrefix) ──────────────────
 // cidrSubnet(prefix, newbits, index) — all derived from /16 base:
@@ -113,7 +128,7 @@ var checkpointExternalIp = cidrHost(hubSubnetExternal, 4)
 resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: 'rg-connectivity-hub-australiaeast-001'
   location: location
-  tags: tags
+  tags: effectiveTags
 }
 
 // ============================================================
@@ -127,7 +142,7 @@ resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
 resource ddosProtectionPlan 'Microsoft.Network/ddosProtectionPlans@2023-09-01' = {
   name    : 'ddos-hub-australiaeast-001'
   location: location
-  tags    : tags
+  tags    : effectiveTags
   scope   : rg
   properties: {}
 }
@@ -146,7 +161,7 @@ module checkpointExternalPip 'br/public:avm/res/network/public-ip-address:0.7.1'
     skuName                : 'Standard'
     publicIPAllocationMethod: 'Static'
     zones                  : ['1', '2', '3']
-    tags                   : tags
+    tags                   : effectiveTags
     diagnosticSettings     : [{ workspaceResourceId: logAnalyticsWorkspaceId }]
   }
 }
@@ -161,7 +176,7 @@ module erGatewayPip 'br/public:avm/res/network/public-ip-address:0.7.1' = {
     skuName                : 'Standard'
     publicIPAllocationMethod: 'Static'
     zones                  : ['1', '2', '3']
-    tags                   : tags
+    tags                   : effectiveTags
     diagnosticSettings     : [{ workspaceResourceId: logAnalyticsWorkspaceId }]
   }
 }
@@ -178,7 +193,7 @@ module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0
   params: {
     name    : 'nsg-checkpoint-external-001'
     location: location
-    tags    : tags
+    tags    : effectiveTags
     securityRules: [
       {
         name: 'Allow-HTTPS-Inbound'
@@ -244,7 +259,7 @@ module nsgCheckpointInternal 'br/public:avm/res/network/network-security-group:0
   params: {
     name    : 'nsg-checkpoint-internal-001'
     location: location
-    tags    : tags
+    tags    : effectiveTags
     securityRules: [
       {
         name: 'Deny-All-Inbound'
@@ -271,7 +286,7 @@ module nsgIngressDmz 'br/public:avm/res/network/network-security-group:0.5.0' = 
   params: {
     name    : 'nsg-ingress-dmz-001'
     location: location
-    tags    : tags
+    tags    : effectiveTags
     securityRules: []
     diagnosticSettings: [{ workspaceResourceId: logAnalyticsWorkspaceId }]
   }
@@ -286,7 +301,7 @@ module nsgManagement 'br/public:avm/res/network/network-security-group:0.5.0' = 
   params: {
     name: 'nsg-management-001'
     location: location
-    tags: tags
+    tags: effectiveTags
     securityRules: [
       {
         name: 'Allow-RDP-from-OnPrem'
@@ -344,7 +359,7 @@ module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
   params: {
     name    : 'rt-to-checkpoint-hub-001'
     location: location
-    tags    : tags
+    tags    : effectiveTags
     routes  : [
       {
         name: 'route-default-to-checkpoint'
@@ -372,7 +387,7 @@ module hubVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
     name           : 'vnet-hub-australiaeast-001'
     location       : location
     addressPrefixes: [hubVnetAddressPrefix]
-    tags           : tags
+    tags           : effectiveTags
     // DDoS Protection Standard (DD34)
     ddosProtectionPlanResourceId: ddosProtectionPlan.id
     subnets: [
@@ -416,7 +431,7 @@ module ingressVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
     name           : 'vnet-ingress-australiaeast-001'
     location       : location
     addressPrefixes: [ingressVnetAddressPrefix]
-    tags           : tags
+    tags           : effectiveTags
     // DDoS Protection Standard (DD34)
     ddosProtectionPlanResourceId: ddosProtectionPlan.id
     subnets: [
@@ -505,7 +520,7 @@ module erGateway 'br/public:avm/res/network/virtual-network-gateway:0.5.0' = {
     vNetResourceId    : hubVnet.outputs.resourceId
     skuName           : erGatewaySku
     gatewayPipName    : erGatewayPip.outputs.name
-    tags              : tags
+    tags              : effectiveTags
     diagnosticSettings: [
       {
         workspaceResourceId: logAnalyticsWorkspaceId
@@ -540,7 +555,7 @@ module checkpointVmss './modules/checkpoint-vmss.bicep' = {
     instanceCount            : checkpointInstanceCount
     internalLbFrontendIp     : checkpointInternalIp
     checkpointExternalStaticIp: checkpointExternalIp
-    tags                     : tags
+    tags                     : effectiveTags
   }
 }
 
@@ -561,6 +576,30 @@ output ddosProtectionPlanId   string = ddosProtectionPlan.id
 // NOTE: erCircuitId is NOT output here — the circuit is created manually.
 // After manual creation, copy the circuit resource ID and use it in
 // the 03b-platform-er-connection workflow.
+
+// Subnet resource IDs — needed by downstream modules (security private endpoints, identity peering)
+output managementSubnetId     string = '${hubVnet.outputs.resourceId}/subnets/snet-management'
+output gatewaySubnetId        string = '${hubVnet.outputs.resourceId}/subnets/GatewaySubnet'
+output internalSubnetId       string = '${hubVnet.outputs.resourceId}/subnets/snet-checkpoint-internal'
+output ingressDmzSubnetId     string = '${ingressVnet.outputs.resourceId}/subnets/snet-ingress-dmz'
+output checkpointVmssId       string = checkpointVmss.outputs.vmssId
+output checkpointInternalLbId string = checkpointVmss.outputs.internalLbId
+output resourceGroupName      string = rg.name
+
+// ============================================================
+// Private DNS Zones — 28 zones for PaaS private endpoints
+// Linked to hub VNet so all spoke workloads resolve PaaS via
+// private endpoints instead of public endpoints
+// ============================================================
+module privateDns './modules/private-dns.bicep' = if (deployPrivateDnsZones) {
+  name: 'deploy-private-dns-zones'
+  scope: rg
+  params: {
+    hubVnetId           : hubVnet.outputs.resourceId
+    location            : location
+    tags                : effectiveTags
+  }
+}
 
 // ============================================================
 // Resource Lock — Hub Connectivity (CanNotDelete)

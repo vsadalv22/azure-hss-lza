@@ -14,9 +14,11 @@ param location string = 'australiaeast'
 param logAnalyticsWorkspaceId string
 
 @description('Alert email — platform operations team')
+@pattern('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$')
 param opsAlertEmail string
 
 @description('Alert email — security / SOC team')
+@pattern('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$')
 param secAlertEmail string
 
 @description('Connectivity subscription ID (for ER / Checkpoint alerts)')
@@ -38,13 +40,22 @@ param tags object = {
   createdBy  : 'alz-bicep'
 }
 
+// ── Effective Tags — merges caller-supplied tags with mandatory platform tags ──
+// Mandatory tags are always applied regardless of what the caller passes.
+// This ensures compliance with the require-tags-on-rg policy (GOV-02).
+var effectiveTags = union(tags, {
+  managedBy : 'platform-team'
+  createdBy : 'alz-bicep'
+  deployedAt: utcNow('yyyy-MM-dd')   // Deployment timestamp for audit trail
+})
+
 // =============================================================
 // Resource Group
 // =============================================================
 resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: 'rg-management-monitoring-001'
   location: location
-  tags: tags
+  tags: effectiveTags
 }
 
 // =============================================================
@@ -66,7 +77,7 @@ module agOps 'br/public:avm/res/insights/action-group:0.4.0' = {
         useCommonAlertSchema: true
       }
     ]
-    tags: tags
+    tags: effectiveTags
   }
 }
 
@@ -85,7 +96,7 @@ module agSec 'br/public:avm/res/insights/action-group:0.4.0' = {
         useCommonAlertSchema: true
       }
     ]
-    tags: tags
+    tags: effectiveTags
   }
 }
 
@@ -97,7 +108,7 @@ module agSec 'br/public:avm/res/insights/action-group:0.4.0' = {
 resource alertPolicyDeleted 'microsoft.insights/activityLogAlerts@2023-01-01-preview' = {
   name: 'alert-policy-assignment-deleted'
   location: 'global'
-  tags: tags
+  tags: effectiveTags
   properties: {
     scopes: ['/subscriptions/${subscription().subscriptionId}']
     enabled: true
@@ -122,7 +133,7 @@ resource alertPolicyDeleted 'microsoft.insights/activityLogAlerts@2023-01-01-pre
 resource alertMgChange 'microsoft.insights/activityLogAlerts@2023-01-01-preview' = {
   name: 'alert-management-group-changed'
   location: 'global'
-  tags: tags
+  tags: effectiveTags
   properties: {
     scopes: ['/subscriptions/${subscription().subscriptionId}']
     enabled: true
@@ -146,7 +157,7 @@ resource alertMgChange 'microsoft.insights/activityLogAlerts@2023-01-01-preview'
 resource alertSecurityContactChanged 'microsoft.insights/activityLogAlerts@2023-01-01-preview' = {
   name: 'alert-defender-security-contact-changed'
   location: 'global'
-  tags: tags
+  tags: effectiveTags
   properties: {
     scopes: ['/subscriptions/${subscription().subscriptionId}']
     enabled: true
@@ -169,7 +180,7 @@ resource alertSecurityContactChanged 'microsoft.insights/activityLogAlerts@2023-
 resource alertServiceHealth 'microsoft.insights/activityLogAlerts@2023-01-01-preview' = {
   name: 'alert-service-health-australiaeast'
   location: 'global'
-  tags: tags
+  tags: effectiveTags
   properties: {
     scopes: ['/subscriptions/${subscription().subscriptionId}']
     enabled: true
@@ -198,13 +209,13 @@ resource alertServiceHealth 'microsoft.insights/activityLogAlerts@2023-01-01-pre
 resource networkWatcherRg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: 'NetworkWatcherRG'
   location: location
-  tags: tags
+  tags: effectiveTags
 }
 
 resource networkWatcher 'Microsoft.Network/networkWatchers@2023-09-01' = {
   name: 'nw-australiaeast-001'
   location: location
-  tags: tags
+  tags: effectiveTags
   // Deploying in NetworkWatcherRG as per Azure convention
 }
 
@@ -215,7 +226,7 @@ resource platformWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
   name: guid(subscription().subscriptionId, 'platform-health-workbook')
   location: location
   kind: 'shared'
-  tags: tags
+  tags: effectiveTags
   properties: {
     displayName: 'HSS Platform Health Dashboard'
     category: 'workbook'
@@ -257,7 +268,7 @@ resource platformWorkbook 'Microsoft.Insights/workbooks@2023-06-01' = {
 resource alertCheckpointUnhealthyBackend 'Microsoft.Insights/metricAlerts@2018-03-01' = if (!empty(checkpointInternalLbId)) {
   name: 'alert-checkpoint-unhealthy-backend-001'
   location: 'global'
-  tags: tags
+  tags: effectiveTags
   properties: {
     description: 'Fires when fewer than 2 Checkpoint VMSS instances are healthy in the internal LB backend pool. Indicates NVA cluster degradation — investigate immediately.'
     severity: 1   // Critical

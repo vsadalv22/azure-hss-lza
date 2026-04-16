@@ -11,9 +11,10 @@ targetScope = 'managementGroup'
 @description('Subscription display name (shown in Azure Portal)')
 param subscriptionDisplayName string
 
-@description('Subscription alias — must be unique, lowercase, hyphens only: sub-<app>-<env>')
+@description('Subscription alias — must follow pattern: sub-<app>-<env>')
 @minLength(3)
 @maxLength(64)
+@pattern('^sub-[a-z0-9]+-[a-z0-9]+$')
 param subscriptionAlias string
 
 @description('Target management group')
@@ -42,7 +43,8 @@ param hubVnetId string
 @description('Azure region')
 param location string = 'australiaeast'
 
-@description('Spoke VNet address prefix — must be a /16, non-overlapping')
+@description('Spoke VNet address prefix — must be a valid CIDR in RFC1918 space')
+@pattern('^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)[0-9.]+/[0-9]{1,2}$')
 param spokeVnetAddressPrefix string
 
 @description('Spoke subnets')
@@ -56,7 +58,8 @@ param routeTableId string
 param logAnalyticsWorkspaceId string
 
 // ── Ownership & Access ────────────────────────────────────────
-@description('Application owner / team email (distribution list)')
+@description('Application owner email (distribution list preferred)')
+@pattern('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$')
 param ownerEmail string
 
 @description('Azure AD group object ID — receives Contributor at subscription scope')
@@ -69,7 +72,8 @@ param readerGroupObjectId string = ''
 @description('Monthly budget in AUD — triggers alert at 80% and 100%')
 param budgetAmountAUD int = 5000
 
-@description('Budget alert email (defaults to owner email if empty)')
+@description('Budget alert email — defaults to ownerEmail if empty')
+@pattern('^$|^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$')
 param budgetAlertEmail string = ''
 
 // ── Security ─────────────────────────────────────────────────
@@ -95,7 +99,8 @@ param enableDefenderContainers bool = false
 @description('Apply CanNotDelete lock to the new subscription. EA subscription deletion is irreversible.')
 param enableSubscriptionLock bool = true
 
-@description('Security contact email for Defender for Cloud alerts on the new subscription')
+@description('Security contact email for Defender for Cloud')
+@pattern('^$|^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$')
 param securityContactEmail string = ''
 
 // ── DevTest Cost Controls ─────────────────────────────────────

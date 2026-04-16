@@ -1,0 +1,43 @@
+# =============================================================
+# Checkov Configuration — WA Health HSS Azure Landing Zone
+# Manages IaC security scan suppressions with justifications.
+# Each suppression MUST have an owner and expiry date.
+# Review suppressions quarterly — remove when no longer needed.
+# =============================================================
+
+framework:
+  - bicep
+
+compact: false
+output: cli
+
+skip-check:
+  # CKV_AZURE_131: Key Vault firewall rules
+  # Justification: We use private endpoints + network ACLs (defaultAction: Deny)
+  #   instead of firewall IP rules. Private endpoint approach is more secure.
+  # Owner: platform-team | Review: 2026-10-01
+  - CKV_AZURE_131
+
+  # CKV_AZURE_35: Storage account network access
+  # Justification: Boot diagnostics storage uses AzureServices bypass for
+  #   Azure diagnostics writes. Private endpoint used for data plane.
+  # Owner: platform-team | Review: 2026-10-01
+  - CKV_AZURE_35
+
+  # CKV_AZURE_33: Storage logging
+  # Justification: Audit logging is handled centrally via Log Analytics
+  #   diagnostic settings and Sentinel, not per-storage account.
+  # Owner: soc-team | Review: 2026-07-01
+  - CKV_AZURE_33
+
+hard-fail-on:
+  # These checks MUST pass — no exceptions
+  - CKV_AZURE_1    # No public access on storage accounts
+  - CKV_AZURE_2    # Storage account secure transfer
+  - CKV_AZURE_3    # Storage minimum TLS version
+  - CKV_AZURE_13   # Key Vault soft delete
+  - CKV_AZURE_42   # Key Vault purge protection
+  - CKV_AZURE_109  # No public network access on Key Vault
+  - CKV_AZURE_50   # VM extension not allowed to execute arbitrary code
+  - CKV_AZURE_149  # No admin access via SSH from internet
+  - CKV_AZURE_178  # No public IP on VM (enforced via policy too)

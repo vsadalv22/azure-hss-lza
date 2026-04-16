@@ -1,9 +1,15 @@
-# HSS Azure Enterprise Landing Zone
+# WA Health HSS — Azure Enterprise Landing Zone
 
+[![Security Checks](https://img.shields.io/badge/Gitleaks-passing-brightgreen?logo=git&logoColor=white)](https://github.com/gitleaks/gitleaks)
+[![Checkov](https://img.shields.io/badge/Checkov-SAST-blue?logo=checkmarx&logoColor=white)](https://www.checkov.io/)
+[![Bicep](https://img.shields.io/badge/Bicep-AVM-0078D4?logo=microsoftazure&logoColor=white)](https://aka.ms/avm)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+> **Organisation:** Western Australian Department of Health — Health Support Services (HSS)
 > **Platform:** Microsoft Azure | **IaC:** Bicep (Azure Verified Modules)
-> **Region:** Australia East | **Billing:** Enterprise Agreement (EA)
-> **Topology:** Hub & Spoke | **WAN Edge:** ExpressRoute | **NVA:** Checkpoint CloudGuard
-> **SIEM:** Microsoft Sentinel | **CI/CD:** GitHub Actions
+> **Primary Region:** Australia East | **Secondary Region:** Perth Extended Zone (PEZ)
+> **Topology:** Hub-and-Spoke | **WAN Edge:** ExpressRoute Direct (MACsec) | **NVA:** Checkpoint CloudGuard R81.10 VMSS
+> **SIEM:** Microsoft Sentinel | **CI/CD:** Azure DevOps (DD03) | **Compliance:** APRA CPS 234, Australian ISM, Essential Eight ML2
 
 ---
 
@@ -11,857 +17,588 @@
 
 1. [Overview](#overview)
 2. [Architecture](#architecture)
-3. [Prerequisites](#prerequisites)
-4. [Repository Structure](#repository-structure)
-5. [First-Time Setup](#first-time-setup)
-6. [Deployment Order](#deployment-order)
-7. [ExpressRoute Configuration](#expressroute-configuration)
-8. [Checkpoint CloudGuard NVA](#checkpoint-cloudguard-nva)
-9. [Microsoft Sentinel](#microsoft-sentinel)
-10. [Subscription Vending Machine](#subscription-vending-machine)
-11. [Subscription Vending — Approval Process](#subscription-vending--approval-process)
-12. [Industry Best Practices Applied](#industry-best-practices-applied)
-13. [GitHub Actions Workflows](#github-actions-workflows)
-14. [Branch Strategy](#branch-strategy)
-15. [GitHub Secrets Reference](#github-secrets-reference)
-16. [Networking Reference](#networking-reference)
-17. [Post-Deployment Checklist](#post-deployment-checklist)
+3. [Repository Structure](#repository-structure)
+4. [Prerequisites](#prerequisites)
+5. [Quick Start](#quick-start)
+6. [Pipeline Deployment Sequence](#pipeline-deployment-sequence)
+7. [Module Reference](#module-reference)
+8. [Compliance](#compliance)
+9. [Security](#security)
+10. [Contributing](#contributing)
+11. [License](#license)
+12. [Contact](#contact)
 
 ---
 
 ## Overview
 
-This repository contains the complete Infrastructure-as-Code for the **HSS Azure Enterprise Landing Zone** — a production-grade, enterprise-scale Azure foundation built on the [Azure Landing Zones](https://aka.ms/alz) architecture framework using [Azure Verified Modules (AVM)](https://aka.ms/avm).
+This repository contains the complete Infrastructure-as-Code (IaC) for the **HSS Azure Enterprise Landing Zone** — a production-grade, enterprise-scale Azure foundation built on the [Azure Landing Zones](https://aka.ms/alz) reference architecture using [Azure Verified Modules (AVM)](https://aka.ms/avm).
+
+It is maintained by the **WA Health HSS Platform Engineering team** and is the authoritative source for all Azure platform infrastructure. No manual changes to platform resources are permitted outside of this codebase.
 
 ### Key Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| IaC toolchain | Bicep + AVM | Native Azure, no state file, strong typing |
-| WAN connectivity | ExpressRoute (Standard / UnlimitedData / 1 Gbps) | Predictable latency, no internet exposure |
-| Firewall / NVA | Checkpoint CloudGuard R81.10 | Existing enterprise Checkpoint investment |
-| Management access | On-prem jump hosts via ExpressRoute | No Bastion — reduces attack surface and cost |
-| SIEM | Microsoft Sentinel | Cloud-native SIEM/SOAR, unified with Defender XDR |
-| Subscription model | EA vending (lz-vending AVM) | Automated spoke provisioning with guardrails |
-| Auth (CI/CD) | OIDC Federated Credentials | No client secrets stored anywhere |
+| IaC toolchain | Bicep + AVM | Native Azure, no state file, strong typing, no extra toolchain dependency |
+| Primary region | Australia East | Highest Azure service availability in Australia |
+| Secondary region | Perth Extended Zone (PEZ) | Low-latency secondary hub for WA government workloads |
+| WAN connectivity | ExpressRoute Direct with MACsec | Layer 2 encryption, no internet exposure, predictable latency |
+| Firewall / NVA | Checkpoint CloudGuard R81.10 VMSS | Existing enterprise Checkpoint investment; VMSS provides HA without Azure Load Balancer |
+| NVA cluster mode | Load Sharing Multicast (2 instances) | Active-active inspection with automatic failover |
+| Management access | On-premises jump hosts via ExpressRoute | No Bastion — reduces attack surface and cost |
+| SIEM | Microsoft Sentinel | Cloud-native SIEM/SOAR, native integration with Microsoft Defender XDR |
+| Subscription model | EA vending (lz-vending AVM) | Automated spoke provisioning with security and network guardrails |
+| CI/CD platform | Azure DevOps (DD03) | Mandated enterprise CI/CD platform; GitHub Actions retained for reference only |
+| Auth (CI/CD) | OIDC Federated Credentials | No client secrets stored — workload identity federation |
+| Secrets management | Azure Key Vault Premium / HSM | CMK on Log Analytics, no plaintext secrets in code or pipelines |
+| Audit logs | Immutable storage (WORM) | Tamper-proof audit trail for APRA CPS 234 and ISM compliance |
+| SAST | Checkov + Gitleaks | Pre-commit and pipeline static analysis for misconfigurations and secrets |
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Tenant Root Group                          │
-│  └── alz (Root Management Group)                                │
-│      ├── platform                                               │
-│      │   ├── management      ← Log Analytics, Sentinel, AA      │
-│      │   ├── connectivity    ← Hub VNet, Checkpoint, ER GW      │
-│      │   └── identity        ← Active Directory Domain Services │
-│      ├── landingzones                                           │
-│      │   ├── corp            ← Internal workloads (ER-peered)   │
-│      │   └── online          ← Internet-facing workloads        │
-│      ├── sandbox                                                │
-│      └── decommissioned                                         │
-└─────────────────────────────────────────────────────────────────┘
+### Management Group Hierarchy
 
-On-Premises Network
-      │
-      │  ExpressRoute Circuit
-      │  Standard / UnlimitedData / 1 Gbps
-      │  Peering: Sydney
-      │
-      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Hub VNet — 10.0.0.0/16  (Connectivity Subscription)           │
-│                                                                 │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ snet-        │  │ snet-        │  │ GatewaySubnet│          │
-│  │ checkpoint-  │  │ checkpoint-  │  │ 10.0.3.0/27  │          │
-│  │ external     │  │ internal     │  │ (ER Gateway) │          │
-│  │ 10.0.0.0/28  │  │ 10.0.1.0/28  │  └──────────────┘          │
-│  │ [eth0 / PIP] │  │ [eth1 / .4]  │                            │
-│  └──────┬───────┘  └──────┬───────┘                            │
-│         │   Checkpoint     │  ← All spoke traffic               │
-│         │   CloudGuard     │    forced via UDR 0.0.0.0/0        │
-│         └──────────────────┘                                    │
-│                                                                 │
-│  ┌──────────────┐                                               │
-│  │ snet-mgmt    │  ← Reachable from on-prem via ER (no Bastion) │
-│  │ 10.0.2.0/24  │                                               │
-│  └──────────────┘                                               │
-└────────────────────────────┬────────────────────────────────────┘
-                             │ VNet Peering (spoke ↔ hub)
-        ┌────────────────────┼────────────────────┐
-        ▼                    ▼                    ▼
-  Corp Spoke             Corp Spoke          Online Spoke
-  10.100.0.0/16         10.101.0.0/16       10.200.0.0/16
-  (vended via           (vended via         (vended via
-   sub-vending)          sub-vending)        sub-vending)
+```
+Tenant Root Group
+  └── alz  (Root Management Group)
+      ├── platform
+      │   ├── management        Log Analytics, Sentinel, Key Vault, Automation Account
+      │   ├── connectivity      Hub VNet, Checkpoint VMSS, ER Gateway, Ingress VNet
+      │   └── identity          Active Directory Domain Services
+      ├── landingzones
+      │   ├── corp              Internal workloads (ExpressRoute-peered)
+      │   └── online            Internet-facing workloads
+      ├── sandbox               Non-production experimental subscriptions
+      └── decommissioned        Subscriptions pending removal
 ```
 
----
+### Network Topology
 
-## Prerequisites
+```
+                              INTERNET
+                                  │
+                          ┌───────▼───────┐
+                          │  Ingress VNet  │   (Connectivity Subscription)
+                          │  10.1.0.0/16  │
+                          │               │
+                          │  ┌──────────┐ │
+                          │  │Checkpoint│ │   Checkpoint CloudGuard R81.10
+                          │  │  VMSS    │ │   2-instance VMSS cluster
+                          │  │(2 nodes) │ │   Load Sharing Multicast
+                          │  └────┬─────┘ │
+                          └───────┼───────┘
+                                  │ VNet Peering
+                          ┌───────▼────────────────────────────────────────┐
+                          │  Hub VNet — 10.0.0.0/16  (Connectivity Sub)    │
+                          │                                                 │
+                          │  ┌─────────────────┐   ┌────────────────────┐  │
+                          │  │  GatewaySubnet  │   │   snet-mgmt        │  │
+                          │  │  10.0.3.0/27    │   │   10.0.2.0/24      │  │
+                          │  │  (ER Gateway)   │   │   (jump / infra)   │  │
+                          │  └────────┬────────┘   └────────────────────┘  │
+                          └───────────┼────────────────────────────────────┘
+                                      │  VNet Peering (hub ↔ spoke)
+                 ┌────────────────────┼────────────────────┐
+                 ▼                    ▼                    ▼
+          Corp Spoke            Corp Spoke           Online Spoke
+          10.100.0.0/16        10.101.0.0/16        10.200.0.0/16
+          (vended)              (vended)              (vended)
+                                      │
+                                      │ All spoke egress routed via
+                                      │ UDR 0.0.0.0/0 → Checkpoint VMSS
+                                      │ (mandatory NVA inspection, no bypass)
 
-### Tools
+  On-Premises Network
+         │
+         │  ExpressRoute Direct (MACsec)
+         │  Circuit created manually by network team
+         │
+         ▼
+  ER Gateway (Hub VNet)
+  ErGw1AZ — zone-redundant
 
-| Tool | Minimum Version | Install |
-|---|---|---|
-| Azure CLI | 2.60.0 | [docs.microsoft.com](https://docs.microsoft.com/cli/azure/install-azure-cli) |
-| Bicep CLI | 0.29.0 | `az bicep install` |
-| PowerShell | 7.4 | [github.com/PowerShell](https://github.com/PowerShell/PowerShell) |
-| Git | 2.40 | [git-scm.com](https://git-scm.com) |
-| GitHub CLI | 2.40 | [cli.github.com](https://cli.github.com) |
+                     ┌────────────────────────────────────────┐
+                     │  Perth Extended Zone (PEZ)             │
+                     │  Secondary Hub (platform/connectivity/ │
+                     │  pez/main.bicep)                       │
+                     │  Reduced-latency secondary for WA      │
+                     └────────────────────────────────────────┘
 
-### Azure Permissions
+                     ┌────────────────────────────────────────┐
+                     │  Management Subscription               │
+                     │  • Log Analytics Workspace (CMK)       │
+                     │  • Microsoft Sentinel (6 rules)        │
+                     │  • Key Vault Premium / HSM             │
+                     │  • Immutable audit storage (WORM)      │
+                     │  • Azure Monitor / Alerts              │
+                     └────────────────────────────────────────┘
 
-| Scope | Role | Purpose |
-|---|---|---|
-| Tenant Root Management Group | Owner | Deploy MG hierarchy, assign policies |
-| Tenant Root Management Group | Management Group Contributor | Move subscriptions between MGs |
-| EA Enrollment Account | Enrollment Account Subscription Creator | Vend new subscriptions |
-| All platform subscriptions | Owner | Deploy platform resources |
-
-### Azure Subscriptions (EA)
-
-Create these **3 platform subscriptions** in the EA portal before running the bootstrap:
-
-| Subscription | Purpose |
-|---|---|
-| `sub-management` | Log Analytics, Automation Account, Microsoft Sentinel |
-| `sub-connectivity` | Hub VNet, Checkpoint NVA, ExpressRoute Gateway |
-| `sub-identity` | Active Directory Domain Controllers |
+                     ┌────────────────────────────────────────┐
+                     │  Identity Subscription                 │
+                     │  • Active Directory Domain Controllers │
+                     │  • Identity VNet peered to Hub         │
+                     └────────────────────────────────────────┘
+```
 
 ---
 
 ## Repository Structure
 
 ```
-hss-azure-ea-lza/
+alz-bicep/
 │
-├── .github/
-│   └── workflows/
-│       ├── 01-platform-management-groups.yml   # MG hierarchy
-│       ├── 02-platform-logging.yml             # Log Analytics + Automation
-│       ├── 03-platform-connectivity.yml        # Hub VNet + Checkpoint + ExpressRoute
-│       ├── 04-subscription-vending.yml         # Automated spoke provisioning
-│       └── 05-platform-sentinel.yml            # Microsoft Sentinel + connectors
-│
-├── platform/
+├── platform/                                  Platform subscriptions IaC
 │   ├── management-groups/
-│   │   └── main.bicep                          # Full MG hierarchy
+│   │   └── main.bicep                         Full ALZ management group hierarchy
 │   ├── logging/
-│   │   └── main.bicep                          # Log Analytics + Automation Account
+│   │   └── main.bicep                         Log Analytics (CMK), Automation Account
 │   ├── connectivity/
-│   │   ├── main.bicep                          # Hub VNet, ER circuit/GW, Checkpoint
-│   │   ├── modules/
-│   │   │   └── checkpoint-nva.bicep            # Checkpoint dual-NIC VM module
-│   │   └── parameters/
-│   │       └── hub-networking.bicepparam
+│   │   ├── main.bicep                         Hub VNet, Ingress VNet, ER Gateway, Checkpoint VMSS
+│   │   ├── pez/
+│   │   │   └── main.bicep                     Perth Extended Zone secondary hub
+│   │   └── modules/
+│   │       ├── checkpoint-vmss.bicep          Checkpoint CloudGuard VMSS cluster (2 instances)
+│   │       ├── checkpoint-nva.bicep           Legacy single-VM NVA (reference only, not deployed)
+│   │       ├── er-connection.bicep            ER Gateway to circuit connection resource
+│   │       ├── private-dns.bicep              28 Private DNS zones (linked to hub VNet)
+│   │       └── private-endpoint.bicep         Reusable private endpoint module
 │   ├── identity/
-│   │   └── main.bicep                          # Identity VNet + AD DS
-│   └── sentinel/
-│       ├── main.bicep                          # Sentinel + connectors + rules
-│       └── parameters/
-│           └── sentinel.bicepparam
+│   │   └── main.bicep                         Identity VNet, AD DS subnet, NSGs
+│   ├── policies/
+│   │   └── main.bicep                         28 policy assignments (deny, audit, DINE)
+│   ├── sentinel/
+│   │   └── main.bicep                         Sentinel workspace, 6 analytics rules, HSP scoping
+│   ├── monitoring/
+│   │   └── main.bicep                         Action groups, alerts, platform workbooks
+│   └── security/
+│       ├── main.bicep                         Key Vault Premium/HSM, immutable audit storage
+│       └── modules/
+│           ├── rbac-assignments.bicep         Centralised RBAC role assignment module
+│           ├── resource-lock.bicep            CanNotDelete lock for platform resource groups
+│           └── private-endpoint.bicep         Private endpoint for Key Vault and storage
 │
-├── subscription-vending/
-│   ├── main.bicep                              # lz-vending AVM module wrapper
-│   └── parameters/
-│       └── example-corp-spoke.bicepparam       # Template for new spokes
+├── subscription-vending/                      Spoke subscription automation
+│   ├── main.bicep                             lz-vending AVM wrapper — EA sub + VNet + peering
+│   └── modules/
+│       ├── defender-plan.bicep                Defender for Cloud plan selection per subscription
+│       ├── subscription-budget.bicep          Budget alerts at 80 / 100 / 120% thresholds
+│       ├── subscription-diagnostics.bicep     Subscription diagnostic settings → central LAW
+│       └── subscription-lock.bicep           CanNotDelete lock on networking resource group
+│
+├── azure-pipelines/                           Azure DevOps pipeline definitions (DD03 — production)
+│
+├── .github/workflows/                         GitHub Actions workflow definitions (reference only)
 │
 ├── scripts/
-│   ├── bootstrap.ps1                           # One-time SP + OIDC setup
-│   └── new-subscription.ps1                    # Scaffold new subscription file
+│   ├── bootstrap.ps1                          One-time: service principal, OIDC, RBAC setup
+│   ├── new-subscription.ps1                   Scaffold a new subscription vending parameter file
+│   └── validate-subscription-request.ps1     IP overlap, naming convention, and tag validation
+│
+├── docs/
+│   ├── deployment-guide.md                    End-to-end deployment walkthrough
+│   ├── expressroute-setup.md                  Manual ExpressRoute circuit creation runbook
+│   ├── checkpoint-first-boot.md               Checkpoint SmartConsole first-time configuration
+│   ├── security-baseline.md                   Security controls and evidence mapping
+│   └── avm-module-versions.md                 Pinned AVM module version reference
 │
 ├── config/
-│   └── inputs.yaml                             # Master configuration reference
+│   └── inputs.yaml                            Master configuration — all environment parameters
 │
-└── bicepconfig.json                            # Bicep linter + module aliases
+├── bicepconfig.json                           Bicep linter rules and module registry aliases
+├── .gitleaks.toml                             Gitleaks secret scanning configuration
+└── .checkov.yaml                              Checkov SAST policy configuration
 ```
 
 ---
 
-## First-Time Setup
+## Prerequisites
 
-### Step 1 — Clone the repository
+### Required Tools
 
-```bash
-git clone https://github.com/vsadalv22/azure-hss-lza.git
-cd azure-hss-lza
-```
-
-### Step 2 — Run bootstrap script
-
-The bootstrap script creates the service principal, configures GitHub OIDC federated credentials (no secrets stored), and assigns the required RBAC roles.
-
-```powershell
-./scripts/bootstrap.ps1 `
-    -TenantId          "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -GitHubOrg         "vsadalv22" `
-    -GitHubRepo        "azure-hss-lza" `
-    -EABillingAccount  "12345678" `
-    -EAEnrollmentAcct  "987654" `
-    -ManagementSubId   "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -ConnectivitySubId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
-    -IdentitySubId     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-### Step 3 — Configure GitHub repository
-
-**Secrets** — navigate to `Settings → Secrets and variables → Actions`:
-
-| Secret Name | Value | When to set |
+| Tool | Minimum Version | Install |
 |---|---|---|
-| `AZURE_TENANT_ID` | Entra ID tenant ID | Now |
-| `AZURE_CLIENT_ID` | Service principal client ID | Now |
-| `MANAGEMENT_SUBSCRIPTION_ID` | Management subscription ID | Now |
-| `CONNECTIVITY_SUBSCRIPTION_ID` | Connectivity subscription ID | Now |
-| `IDENTITY_SUBSCRIPTION_ID` | Identity subscription ID | Now |
-| `EA_BILLING_ACCOUNT` | EA billing account number | Now |
-| `EA_ENROLLMENT_ACCOUNT` | EA enrollment account number | Now |
-| `CHECKPOINT_ADMIN_PASSWORD` | Strong VM password | Now |
-| `SENTINEL_SECURITY_CONTACT` | SOC team email address | Now |
-| `LOG_ANALYTICS_WORKSPACE_ID` | LAW resource ID | After workflow 02 |
-| `HUB_VNET_ID` | Hub VNet resource ID | After workflow 03 |
-| `ROUTE_TABLE_ID` | UDR resource ID | After workflow 03 |
+| Azure CLI | 2.60.0 | [docs.microsoft.com/cli/azure](https://docs.microsoft.com/cli/azure/install-azure-cli) |
+| Bicep CLI | 0.29.0 | `az bicep install && az bicep upgrade` |
+| PowerShell | 7.4 | [github.com/PowerShell](https://github.com/PowerShell/PowerShell/releases) |
+| Git | 2.40 | [git-scm.com](https://git-scm.com/downloads) |
+| Checkov | 3.x | `pip install checkov` |
+| Gitleaks | 8.x | [github.com/gitleaks/gitleaks](https://github.com/gitleaks/gitleaks/releases) |
 
-**Environments** — navigate to `Settings → Environments`:
+### Azure Permissions
 
-| Environment | Required Reviewers | Used By |
+The deployment service principal requires the following permissions before running the bootstrap:
+
+| Scope | Role | Purpose |
 |---|---|---|
-| `platform-production` | Platform team leads | Workflows 01, 02, 03, 05 |
-| `subscription-vending` | Security + Network team | Workflow 04 |
+| Tenant Root Management Group | Owner | Deploy MG hierarchy, assign policies at root |
+| Tenant Root Management Group | Management Group Contributor | Move subscriptions between management groups |
+| EA Enrollment Account | Enrollment Account Subscription Creator | Vend new Azure subscriptions |
+| Management Subscription | Owner | Deploy Log Analytics, Sentinel, Key Vault |
+| Connectivity Subscription | Owner | Deploy Hub VNet, Checkpoint VMSS, ER Gateway |
+| Identity Subscription | Owner | Deploy identity VNet and AD DS resources |
 
-### Step 4 — Fill in ExpressRoute parameters
+### Platform Subscriptions
 
-Edit `platform/connectivity/parameters/hub-networking.bicepparam` and set:
+Create these three platform subscriptions in the EA portal **before** running the bootstrap script. Do not place them in management groups manually — the pipeline handles that.
 
-```bicep
-param erServiceProviderName = 'YourProvider'   // e.g. 'Equinix' or 'Megaport'
-param erPeeringLocation     = 'Sydney'
+| Subscription | Purpose |
+|---|---|
+| `sub-management-prod` | Log Analytics, Sentinel, Key Vault, Automation Account |
+| `sub-connectivity-prod` | Hub VNet, Ingress VNet, Checkpoint VMSS, ER Gateway |
+| `sub-identity-prod` | Active Directory Domain Services |
+
+---
+
+## Quick Start
+
+> For a complete step-by-step walkthrough, see **[docs/deployment-guide.md](docs/deployment-guide.md)**.
+
+The five-minute overview:
+
+1. **Clone** this repository and review `config/inputs.yaml` — this file contains all environment-specific parameters.
+
+2. **Run the bootstrap script** — creates the service principal, configures OIDC federated credentials in Azure DevOps (no stored secrets), and assigns the required RBAC roles:
+
+   ```powershell
+   ./scripts/bootstrap.ps1 `
+       -TenantId          "<entra-tenant-id>" `
+       -EABillingAccount  "<ea-billing-account-number>" `
+       -EAEnrollmentAcct  "<ea-enrollment-account-number>" `
+       -ManagementSubId   "<management-subscription-id>" `
+       -ConnectivitySubId "<connectivity-subscription-id>" `
+       -IdentitySubId     "<identity-subscription-id>"
+   ```
+
+3. **Configure Azure DevOps** — add variable groups in DD03 for tenant IDs, subscription IDs, and Key Vault references. No plaintext secrets are stored in pipeline variables — all sensitive values are referenced from Key Vault.
+
+4. **Run pipelines in order** — see [Pipeline Deployment Sequence](#pipeline-deployment-sequence) below.
+
+5. **Complete manual steps** — the ExpressRoute circuit must be created by the network team after the ER Gateway is deployed. See [docs/expressroute-setup.md](docs/expressroute-setup.md) and [docs/checkpoint-first-boot.md](docs/checkpoint-first-boot.md).
+
+---
+
+## Pipeline Deployment Sequence
+
+Run each pipeline stage in the order shown. Each stage depends on outputs from the previous.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 1 — Management Groups                                        │
+│  Pipeline: azure-pipelines/01-management-groups.yml                 │
+│  Scope: Tenant root                                                  │
+│  Deploys: Full ALZ management group hierarchy                        │
+│  Output: Management group resource IDs                               │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 2 — Logging                                                   │
+│  Pipeline: azure-pipelines/02-logging.yml                           │
+│  Scope: Management subscription                                      │
+│  Deploys: Log Analytics Workspace (CMK), Automation Account         │
+│  Output: Log Analytics workspace resource ID (→ config/inputs.yaml) │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 3 — Security Baseline                                        │
+│  Pipeline: azure-pipelines/03-security.yml                          │
+│  Scope: Management subscription                                      │
+│  Deploys: Key Vault Premium/HSM, immutable audit storage (WORM)     │
+│  Output: Key Vault URI (used by all subsequent stages)               │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 4 — Connectivity                                              │
+│  Pipeline: azure-pipelines/04-connectivity.yml                      │
+│  Scope: Connectivity subscription                                    │
+│  Deploys: Hub VNet, Ingress VNet, Checkpoint VMSS cluster,          │
+│           ER Gateway, Private DNS zones (28), PEZ secondary hub     │
+│  Output: Hub VNet ID, Checkpoint LB IP, ER Gateway ID               │
+│                                                                     │
+│  *** MANUAL STEP — Network team creates ExpressRoute Direct         │
+│      circuit with MACsec in Azure Portal and sends service key      │
+│      to provider. See: docs/expressroute-setup.md                   │
+│      Wait for ProviderState = Provisioned (typically 1–5 days)      │
+│      Update inputs.yaml with circuit resource ID, then run          │
+│      Stage 4b to link the ER Gateway to the circuit.                │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 4b — ER Connection  (manual trigger only)                    │
+│  Pipeline: azure-pipelines/04b-er-connection.yml                    │
+│  Scope: Connectivity subscription                                    │
+│  Pre-flight: Validates ProviderState = Provisioned before deploying │
+│  Deploys: ER Gateway ↔ Circuit connection resource                  │
+│  Output: BGP routes established, on-premises connectivity live       │
+│                                                                     │
+│  *** MANUAL STEP — Complete Checkpoint first-boot configuration.    │
+│      SSH to Checkpoint VMSS instances from on-premises jump host    │
+│      over ExpressRoute. See: docs/checkpoint-first-boot.md          │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 5 — Identity                                                  │
+│  Pipeline: azure-pipelines/05-identity.yml                          │
+│  Scope: Identity subscription                                        │
+│  Deploys: Identity VNet, subnets for AD DS, NSGs, VNet peering      │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 6 — Policies                                                  │
+│  Pipeline: azure-pipelines/06-policies.yml                          │
+│  Scope: Root management group                                        │
+│  Deploys: 28 policy assignments (deny, audit, DeployIfNotExists)     │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 7 — Sentinel                                                  │
+│  Pipeline: azure-pipelines/07-sentinel.yml                          │
+│  Scope: Management subscription                                      │
+│  Deploys: Sentinel workspace enablement, 6 analytics rules,         │
+│           HSP scoping (Healthcare Sentinel Package)                 │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 8 — Monitoring                                                │
+│  Pipeline: azure-pipelines/08-monitoring.yml                        │
+│  Scope: Management subscription                                      │
+│  Deploys: Action groups, platform alerts, Azure Monitor workbooks   │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Subscription Vending  (ongoing — triggered per spoke request)      │
+│  Pipeline: azure-pipelines/09-subscription-vending.yml              │
+│  Scope: Root management group                                        │
+│  Trigger: PR adding a new parameter file to subscription-vending/   │
+│  Deploys: EA subscription, spoke VNet + peering, UDR, RBAC,        │
+│           Defender plans, budget alerts, diagnostic settings         │
+│  Approval: Network review → Security review → Platform lead sign-off│
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Deployment Order
+## Module Reference
 
-> Run each workflow in sequence — each stage builds on the previous one.
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  Workflow 01 — Management Groups                         │
-│  Scope: Tenant                                           │
-│  Creates MG hierarchy under root                         │
-└──────────────────────────┬───────────────────────────────┘
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  Workflow 02 — Logging                                   │
-│  Scope: Management Subscription                          │
-│  Creates Log Analytics + Automation Account              │
-│  → Update secret: LOG_ANALYTICS_WORKSPACE_ID             │
-└──────────────────────────┬───────────────────────────────┘
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  Workflow 03 — Connectivity                              │
-│  Scope: Connectivity Subscription                        │
-│  Creates Hub VNet, Checkpoint NVA, ER Gateway            │
-│  → Update secrets: HUB_VNET_ID, ROUTE_TABLE_ID,          │
-│                    ER_GATEWAY_ID                         │
-│                                                          │
-│  ⚠️  MANUAL STEP — Network team creates ER circuit       │
-│     in Azure Portal and sends service key to provider    │
-│     See: docs/expressroute-setup.md                      │
-│     Wait for ProviderState = Provisioned (1–5 days)      │
-│     Set secret: ER_CIRCUIT_RESOURCE_ID                   │
-└──────────────────────────┬───────────────────────────────┘
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  Workflow 03b — ER Connection  (manual trigger only)     │
-│  Scope: Connectivity Subscription                        │
-│  Links ER Gateway to manually-created circuit            │
-│  Pre-flight check: verifies ProviderState = Provisioned  │
-│  → BGP routes established, on-prem connectivity live     │
-└──────────────────────────┬───────────────────────────────┘
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  Workflow 05 — Sentinel                                  │
-│  Scope: Management Subscription                          │
-│  Enables Sentinel, connectors, analytics rules, UEBA     │
-└──────────────────────────┬───────────────────────────────┘
-                           ▼
-┌──────────────────────────────────────────────────────────┐
-│  Workflow 04 — Subscription Vending  (ongoing)           │
-│  Triggered by: PR adding a .bicepparam file              │
-│  Creates spoke subscription + VNet + peering + RBAC      │
-└──────────────────────────────────────────────────────────┘
-```
-
----
-
-## ExpressRoute Configuration
-
-> **Design decision:** The ExpressRoute **circuit** is created and maintained **manually** by the network team. It is not managed by IaC. This separates the commercial / provider relationship from the automated infrastructure pipeline.
-
-### What is Automated vs Manual
-
-| Resource | Managed by | Workflow |
-|---|---|---|
-| ER Gateway `ergw-hub-australiaeast-001` | **IaC (Bicep)** | `03-platform-connectivity` |
-| ER Circuit `erc-hub-australiaeast-001` | **Manual — network team** | See `docs/expressroute-setup.md` |
-| ER Connection `con-ergw-to-circuit-001` | **IaC (Bicep)** | `03b-platform-er-connection` |
-
-### End-to-End Provisioning Flow
-
-```
-  IaC (Workflow 03)              Manual — Network Team             IaC (Workflow 03b)
-  ─────────────────              ─────────────────────             ──────────────────
-  Deploy ER Gateway         →    Create ER circuit in Portal   →   Run workflow 03b
-  (ErGw1AZ, zone-redundant)      Send service key to provider       with circuit resource ID
-  Output: ER_GATEWAY_ID          Wait for ProviderState:            Pre-flight verifies
-                                  Provisioned (1–5 days)             ProviderState = Provisioned
-                                 Copy circuit resource ID            Deploys connection resource
-                                 Set ER_CIRCUIT_RESOURCE_ID          Gateway ↔ Circuit linked
-                                  GitHub secret                      BGP routes established
-```
-
-### Gateway Details
-
-| Parameter | Value |
-|---|---|
-| Gateway name | `ergw-hub-australiaeast-001` |
-| SKU | `ErGw1AZ` — zone-redundant across 3 AZs, up to 1 Gbps |
-| Gateway subnet | `GatewaySubnet` — `10.0.3.0/27` |
-| Public IP | `pip-ergw-hub-001` — Standard, Static, Zone-redundant |
-
-### Recommended Circuit Settings (Manual Creation)
-
-| Parameter | Recommended Value |
-|---|---|
-| Circuit name | `erc-hub-australiaeast-001` |
-| Region | `Australia East` |
-| Peering location | `Sydney` |
-| Bandwidth | `1 Gbps` (upgradeable online without downtime) |
-| SKU tier | `Standard` |
-| SKU family | `UnlimitedData` (avoids unpredictable egress costs) |
-| Resource group | `rg-connectivity-hub-australiaeast-001` |
-
-### Full Manual Runbook
-
-See **[docs/expressroute-setup.md](docs/expressroute-setup.md)** for the complete step-by-step guide including:
-- Portal and CLI instructions for circuit creation
-- How to send the service key to your provider
-- How to verify provisioning status
-- How to trigger workflow `03b` to link the gateway
-- Troubleshooting and bandwidth upgrade guidance
-
-### New GitHub Secret Required After Manual Circuit Creation
-
-| Secret | Value |
-|---|---|
-| `ER_CIRCUIT_RESOURCE_ID` | Circuit resource ID (set after manual circuit creation) | `/subscriptions/.../expressRouteCircuits/erc-...` |
-| `ER_GATEWAY_ID` | ER Gateway resource ID | Set from workflow 03 output |
-
----
-
-## Checkpoint CloudGuard NVA
-
-### VM Details
-
-| Parameter | Value |
-|---|---|
-| VM name | `vm-checkpoint-hub-001` |
-| VM size | `Standard_D3_v2` (upgradeable) |
-| Image | Checkpoint CloudGuard R81.10 (`check-point-cg-r8110`) |
-| Licence | BYOL (`sg-byol`) — bring your own Checkpoint licence |
-| External NIC (eth0) | `snet-checkpoint-external` — static IP `10.0.0.4` with PIP |
-| Internal NIC (eth1) | `snet-checkpoint-internal` — static IP `10.0.1.4` |
-| UDR | All spoke subnets: `0.0.0.0/0 → 10.0.1.4` |
-
-### Management Access (No Bastion)
-
-Since Azure Bastion is not deployed, connect to the Checkpoint VM via:
-
-1. On-premises workstation over **ExpressRoute**
-2. SSH to `10.0.0.4` (external NIC) from on-prem jump host
-3. Or access the management VMs in `snet-management` (10.0.2.0/24)
-
-### Post-Deploy Checkpoint Setup
-
-```
-1. SSH to 10.0.0.4 from on-prem jump host
-2. Run 'clish' and complete First Time Configuration wizard
-3. Set SIC one-time password (used by SmartConsole)
-4. From SmartConsole (on-prem): connect to 10.0.0.4
-5. Initialize gateway with SIC password
-6. Install Access Policy
-7. Apply BYOL licence via SmartConsole → Licences
-```
-
-### Checkpoint Management Ports
-
-Allow these ports from on-prem networks via NSG / ER routing:
-
-| Port | Protocol | Purpose |
-|---|---|---|
-| 22 | TCP | SSH |
-| 443 | TCP | HTTPS / Web SmartConsole |
-| 18190 | TCP | SmartConsole communication |
-| 19009 | TCP | Log server |
-| 257 | TCP | CPD (policy push) |
-| 8211 | TCP | CPRID |
-
----
-
-## Microsoft Sentinel
-
-### Enabled Components
-
-| Component | Details |
-|---|---|
-| Workspace | `law-management-australiaeast-001` (shared with logging) |
-| UEBA | Enabled — sources: AuditLogs, AzureActivity, SecurityEvent, SigninLogs |
-| Entity Analytics | ActiveDirectory + AzureActiveDirectory |
-| Retention | 365 days |
-
-### Data Connectors (8 enabled)
-
-| Connector | Data Collected |
-|---|---|
-| Azure Active Directory | Sign-in logs, Audit logs |
-| Azure Activity | Subscription-level operations |
-| Microsoft Defender for Cloud | Security alerts |
-| Microsoft Defender XDR | Incidents + cross-product alerts |
-| Microsoft Defender for Endpoint | Endpoint alerts |
-| Microsoft Defender for Identity | Identity-based alerts |
-| Office 365 | Exchange, SharePoint, Teams |
-| Threat Intelligence | IOC indicators |
-
-### Analytics Rules (5 built-in)
-
-| Rule | Severity | Tactic |
-|---|---|---|
-| Sign-in from multiple geographies | Medium | Initial Access |
-| Privileged role assigned | High | Privilege Escalation |
-| Mass resource deletion | High | Impact |
-| NVA / Firewall config changed | Medium | Defence Evasion |
-| Password spray attack | High | Credential Access |
-
-### Post-Deploy Sentinel Steps
-
-1. **Populate watchlist** — add on-prem CIDR blocks (ER-connected) to `TrustedIPRanges` watchlist
-2. **TAXII feed** — configure threat intelligence TAXII feed URL in the TI connector
-3. **RBAC** — assign `Microsoft Sentinel Contributor` to SOC team AAD group
-4. **Defender for Cloud** — enable Defender Standard plans on all subscriptions
-5. **Tune rules** — adjust query thresholds in analytics rules for your environment
-
----
-
-## Subscription Vending Machine
-
-### How It Works
-
-```
-Developer / App Team                  Platform Team (review)
-        │                                     │
-        │  1. Run new-subscription.ps1        │
-        │     (scaffolds .bicepparam file)    │
-        │                                     │
-        │  2. git commit + Push PR ──────────►│
-        │                                     │  3. What-if posted as PR comment
-        │                                     │  4. Review & approve PR
-        │◄───────────────────────────────────  │
-        │
-        │  5. Merge to main
-        │     ↓ Triggers workflow 04
-        │     ↓ Requires Environment approval
-        │     ↓ Deploys:
-        │        • EA subscription (in Corp or Online MG)
-        │        • Spoke VNet (peered to hub via Checkpoint)
-        │        • UDR (0.0.0.0/0 → Checkpoint 10.0.1.4)
-        │        • RBAC (app team AAD group → Contributor)
-```
-
-### Create a New Spoke Subscription
-
-```powershell
-./scripts/new-subscription.ps1 `
-    -SubscriptionAlias   "sub-myapp-prod" `
-    -DisplayName         "My Application Production" `
-    -TargetMG            "alz-landingzones-corp" `
-    -SpokeAddressPrefix  "10.101.0.0/16" `
-    -OwnerEmail          "myteam@company.com" `
-    -OwnerGroupObjectId  "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-Then open a Pull Request — the what-if output will be posted as a comment automatically.
-
----
-
----
-
-## Subscription Vending — Approval Process
-
-Every new subscription vending request goes through a **4-stage gate process** before any Azure resources are created.
-
-### Stage Overview
-
-```
-  REQUESTOR                 AUTOMATED                  HUMAN REVIEW               DEPLOY
-      │                         │                           │                        │
-      │  1. Raise GitHub Issue  │                           │                        │
-      │  (subscription-request  │                           │                        │
-      │   issue template)       │                           │                        │
-      ├────────────────────────►│                           │                        │
-      │                         │  2. Platform team creates │                        │
-      │                         │     .bicepparam file,     │                        │
-      │                         │     opens Pull Request    │                        │
-      │                         ├──────────────────────────►│                        │
-      │                         │                           │                        │
-      │                         │  Stage 1: VALIDATE (auto) │                        │
-      │                         │  • Bicep lint             │                        │
-      │                         │  • IP overlap check       │                        │
-      │                         │  • Naming convention      │                        │
-      │                         │  • Mandatory tags         │                        │
-      │                         │                           │                        │
-      │                         │  Stage 2: WHAT-IF (auto)  │                        │
-      │                         │  • ARM what-if posted     │                        │
-      │                         │    as PR comment          │                        │
-      │                         │                           │                        │
-      │                         │                           │  Stage 3: REVIEW       │
-      │                         │                           │  (3 teams in parallel) │
-      │                         │                           │  🔌 Network team       │
-      │                         │                           │  🔒 Security team      │
-      │                         │                           │  🏗️ Platform leads     │
-      │                         │                           │  (all 3 must approve)  │
-      │                         │                           │                        │
-      │                         │                           │         Stage 4: DEPLOY│
-      │                         │                           │  • EA subscription     │
-      │                         │                           │  • Spoke VNet + peering│
-      │                         │                           │  • UDR via Checkpoint  │
-      │                         │                           │  • RBAC assignment     │
-      │                         │                           │  • Defender for Cloud  │
-      │                         │                           │  • Budget alerts       │
-      │◄────────────────────────────────────────────────────────────────────────────┤
-      │  Notified via PR comment with subscription ID and next steps                │
-```
-
-### Step-by-Step Guide for Requesting a New Subscription
-
-#### Step 1 — Raise a GitHub Issue
-
-Navigate to **Issues → New Issue → "🆕 New Subscription Request"** and complete the form. Fields include:
-- Application name, display name, environment
-- Target management group (corp / online / sandbox)
-- Business unit and cost centre
-- Owner email and Azure AD group Object ID
-- Requested spoke CIDR (must be from the allocated range)
-- Required subnets with CIDR and purpose
-- Internet egress requirements
-- Data classification
-- Applicable compliance frameworks (APRA CPS 234, ISM, Essential Eight, PCI-DSS)
-- Microsoft Defender plan selection
-- Monthly budget estimate
-
-#### Step 2 — Platform Team Creates the Parameter File
-
-After reviewing the Issue, a platform team member runs:
-
-```powershell
-./scripts/new-subscription.ps1 `
-    -SubscriptionAlias   "sub-myapp-prod" `
-    -DisplayName         "MyApp Production — Payments" `
-    -TargetMG            "alz-landingzones-corp" `
-    -SpokeAddressPrefix  "10.101.0.0/16" `
-    -OwnerEmail          "team@company.com.au" `
-    -OwnerGroupObjectId  "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-Then reviews and completes the generated `.bicepparam` file (setting budget, Defender plans, compliance tags), and opens a Pull Request referencing the original Issue.
-
-#### Step 3 — Automated Validation (Stage 1 & 2)
-
-On PR creation, GitHub Actions automatically:
-
-| Check | What it validates |
-|---|---|
-| **Bicep lint** | Template syntax and best-practice rules |
-| **Naming convention** | `sub-<app>-<env>` lowercase format |
-| **IP overlap detection** | Spoke CIDR vs hub, identity, and all existing spokes |
-| **CIDR range alignment** | Corp spokes: 10.100-199.x.x / Online spokes: 10.200-254.x.x |
-| **Mandatory tags** | `environment`, `ownerEmail`, `dataClassification`, `costCenter` |
-| **Owner fields** | Valid email + GUID format for AAD group |
-| **Budget** | `budgetAmountAUD` is set |
-| **ARM What-If** | Full deployment preview posted as PR comment |
-
-All results are posted as comments on the PR. If any automated check fails, the PR is blocked until resolved.
-
-#### Step 4 — Three-Team Human Review (Stage 3)
-
-All three approvals must be granted — they run in **parallel** to minimise wait time:
-
-| Team | GitHub Environment | Reviews |
-|---|---|---|
-| 🔌 **Network Team** | `vending-network-review` | IP allocation confirmed, routing via Checkpoint, peering design |
-| 🔒 **Security Team** | `vending-security-review` | Data classification, Defender plan, compliance scope, internet egress |
-| 🏗️ **Platform Leads** | `vending-platform-approval` | Final architecture sign-off (runs after both teams above) |
-
-Each reviewer clicks **"Review deployments"** in the Actions tab of their assigned environment gate.
-
-#### Step 5 — Automated Deployment (Stage 4)
-
-After all three approvals, the pipeline automatically:
-
-1. Creates the EA subscription and places it in the correct MG
-2. Provisions the spoke VNet with all subnets
-3. Peers the spoke to the hub (traffic routes via Checkpoint NVA)
-4. Assigns RBAC to the AAD group
-5. Enables the selected Defender for Cloud plans
-6. Creates budget alerts at 80%, 100%, and 120% of monthly budget
-7. Configures subscription-level diagnostic settings → central Log Analytics
-8. Posts a success summary comment on the originating PR
-
-### Setting Up the Approval Environments
-
-Configure in **Settings → Environments**:
-
-| Environment | Required Reviewers | Notes |
-|---|---|---|
-| `vending-network-review` | Network team GitHub accounts / team | Parallel with security |
-| `vending-security-review` | Security team GitHub accounts / team | Parallel with network |
-| `vending-platform-approval` | Platform lead accounts | Runs after both above |
-| `platform-production` | Platform leads | Used by platform workflows 01–03, 05–07 |
-
----
-
-## Industry Best Practices Applied
-
-This landing zone is built to align with the following standards and frameworks:
-
-### Security
-
-| Practice | Implementation |
-|---|---|
-| **Zero internet exposure for management** | No Bastion, no public IPs on VMs — access via ExpressRoute from on-prem |
-| **All egress via NVA** | UDR `0.0.0.0/0 → Checkpoint 10.0.1.4` applied to every spoke subnet |
-| **No public IPs on VMs** | Azure Policy `DENY — Public IP addresses on virtual machines` |
-| **No RDP / SSH from internet** | Azure Policy enforced on all NSGs |
-| **HTTPS only** | Azure Policy denies HTTP on storage accounts |
-| **Key Vault protection** | Policy requires soft delete + purge protection |
-| **Microsoft Defender** | Auto-deployed to every vended subscription via policy + vending module |
-| **SIEM** | Microsoft Sentinel with 8 connectors, UEBA, and 5 analytics rules |
-| **OIDC authentication** | No client secrets stored anywhere — federated credentials only |
-
-### Governance
-
-| Practice | Implementation |
-|---|---|
-| **Management group hierarchy** | 5-level ALZ hierarchy — Corp, Online, Sandbox, Decommissioned |
-| **Azure Policy** | 15 built-in policy assignments at root MG — deny, audit, and DINE effects |
-| **Mandatory tagging** | Policy enforced: `environment`, `managedBy`, `costCenter`, `createdBy` |
-| **Resource locks** | Network RG locked in every vended subscription |
-| **Allowed regions** | Policy restricts deployments to `australiaeast` + `australiasoutheast` only |
-| **No classic admins** | Policy audits and flags legacy RBAC administrators |
-| **No custom owner roles** | Policy denies custom subscription owner role definitions |
-| **Budget alerts** | 80% forecast, 100% actual, 120% actual alerts on every subscription |
-
-### Networking
-
-| Practice | Implementation |
-|---|---|
-| **Hub & Spoke** | Centralised connectivity subscription, all spokes peer to hub |
-| **Private DNS** | 28 private DNS zones in hub, linked to hub VNet, spokes resolve via peering |
-| **ExpressRoute** | Standard / UnlimitedData / 1 Gbps — no VPN, no internet crossing |
-| **Zone-redundant gateway** | `ErGw1AZ` across all 3 availability zones in Australia East |
-| **NSG on all subnets** | Checkpoint external and internal subnets have NSGs with least-privilege rules |
-| **Network Watcher** | Deployed per subscription for flow log analysis |
-
-### Observability
-
-| Practice | Implementation |
-|---|---|
-| **Centralised logging** | All resources send diagnostics to central Log Analytics workspace |
-| **Activity logs** | Subscription activity log streamed to LAW on every vended subscription |
-| **Platform alerts** | Action groups for ops team + SOC; alerts on policy delete, MG change, Service Health |
-| **Sentinel analytics** | 5 scheduled analytics rules with entity mapping and MITRE ATT&CK tagging |
-| **Platform workbook** | Azure Monitor workbook for hub network + Sentinel health |
-
-### CI/CD and IaC
-
-| Practice | Implementation |
-|---|---|
-| **Infrastructure as Code** | 100% Bicep — no manual portal changes |
-| **Azure Verified Modules** | All resources use AVM modules from `mcr.microsoft.com/bicep` |
-| **What-if before deploy** | Every workflow runs ARM what-if and requires review before deploy |
-| **Approval gates** | GitHub Environments with required reviewers on all production workflows |
-| **CODEOWNERS** | Automatic reviewer assignment per path — security team owns sentinel, network team owns connectivity |
-| **PR template** | Structured checklist ensures consistent review for all change types |
-| **Issue template** | Structured subscription request form captures all required information upfront |
-| **Validation script** | Automated IP overlap and naming checks block invalid requests before human review |
-| **Secrets management** | All sensitive values in GitHub secrets — never in code |
-| **Branch protection** | `main`, `staging`, `prod` branches require PRs and status checks |
-
-### Compliance Alignment
-
-| Framework | Coverage |
-|---|---|
-| **APRA CPS 234** | Encryption, access control, logging, incident response (Sentinel), third-party access controls |
-| **Australian ISM** | Asset classification via tags, network segmentation, multi-factor authentication (AAD), audit logging |
-| **Essential Eight** | Application control readiness (Defender), patch management (Update Manager via policy), MFA, restrict admin privileges |
-| **ISO 27001** | Asset management (tags), access control (RBAC + policy), logging (LAW + Sentinel), continuity (ER zone-redundant) |
-
----
-
-## GitHub Actions Workflows
-
-| Workflow | Trigger | Scope | Environment Gate |
+| Module | Path | Target Scope | Description |
 |---|---|---|---|
-| `01-platform-management-groups.yml` | Push to `main` (`platform/management-groups/**`) | Tenant | `platform-production` |
-| `02-platform-logging.yml` | Push to `main` (`platform/logging/**`) | Management Sub | `platform-production` |
-| `03-platform-connectivity.yml` | Push to `main` (`platform/connectivity/**`, excl. `er-connection.bicep`) | Connectivity Sub | `platform-production` |
-| `03b-platform-er-connection.yml` | **Manual trigger only** — run after provider provisions ER circuit | Connectivity Sub RG | `platform-production` |
-| `04-subscription-vending.yml` | Push to `main` (`subscription-vending/parameters/**`) | Root MG | `vending-network-review` → `vending-security-review` → `vending-platform-approval` |
-| `05-platform-sentinel.yml` | Push to `main` (`platform/sentinel/**`) | Management Sub | `platform-production` |
-| `06-platform-policies.yml` | Push to `main` (`platform/policies/**`) | Root MG | `platform-production` |
-| `07-platform-monitoring.yml` | Push to `main` (`platform/monitoring/**`) | Management Sub | `platform-production` |
+| Management Groups | `platform/management-groups/main.bicep` | Tenant | Deploys the full ALZ management group hierarchy (alz root → platform, landingzones, sandbox, decommissioned, and child groups) |
+| Logging | `platform/logging/main.bicep` | Management subscription | Log Analytics Workspace with customer-managed key (CMK), Automation Account, diagnostic settings |
+| Connectivity | `platform/connectivity/main.bicep` | Connectivity subscription | Hub VNet, Ingress VNet, Checkpoint CloudGuard VMSS cluster, ExpressRoute Gateway, 28 Private DNS zones |
+| PEZ (Perth Extended Zone) | `platform/connectivity/pez/main.bicep` | Connectivity subscription | Secondary hub VNet in Perth Extended Zone, peered to primary hub |
+| Identity | `platform/identity/main.bicep` | Identity subscription | Identity VNet with AD DS subnets, NSGs, hub VNet peering |
+| Policies | `platform/policies/main.bicep` | Root management group | 28 Azure Policy assignments covering deny, audit, and DeployIfNotExists (DINE) effects |
+| Sentinel | `platform/sentinel/main.bicep` | Management subscription | Microsoft Sentinel enablement, 6 scheduled analytics rules, UEBA, Healthcare Sentinel Package (HSP) scoping |
+| Monitoring | `platform/monitoring/main.bicep` | Management subscription | Action groups (ops and SOC), platform metric alerts, Azure Monitor workbooks |
+| Security Baseline | `platform/security/main.bicep` | Management subscription | Key Vault Premium with HSM, immutable audit storage (WORM), private endpoints, resource locks |
+| Subscription Vending | `subscription-vending/main.bicep` | Root management group | Automated spoke provisioning using lz-vending AVM: EA subscription, VNet, hub peering, UDR, RBAC, Defender, budget, diagnostics |
 
-All workflows use:
-- **OIDC authentication** — no stored client secrets
-- **Bicep lint** → **what-if** → **manual approval** → **deploy** pipeline
-- **Deployment outputs** uploaded as GitHub Actions artifacts
+### Connectivity Sub-Modules
 
----
-
-## Branch Strategy
-
-| Branch | Purpose | Deploys to |
+| Module | Path | Description |
 |---|---|---|
-| `main` | Production-ready code — protected, requires PR | Production Azure environment |
-| `staging` | Pre-production validation | Staging / UAT Azure environment |
-| `dev` | Active development and feature branches | Dev Azure environment |
+| Checkpoint VMSS | `platform/connectivity/modules/checkpoint-vmss.bicep` | Checkpoint CloudGuard R81.10 VMSS cluster, 2 instances, Load Sharing Multicast, autoscale disabled |
+| Checkpoint NVA (legacy) | `platform/connectivity/modules/checkpoint-nva.bicep` | Single-VM NVA reference implementation — not deployed in production |
+| ER Connection | `platform/connectivity/modules/er-connection.bicep` | ExpressRoute Gateway to circuit connection resource (run after manual circuit creation) |
+| Private DNS | `platform/connectivity/modules/private-dns.bicep` | 28 Private DNS zones for Azure PaaS services, linked to hub VNet |
+| Private Endpoint | `platform/connectivity/modules/private-endpoint.bicep` | Reusable private endpoint module used across platform modules |
 
-### Branch Protection Rules (recommended)
+### Security Sub-Modules
 
-Configure in `Settings → Branches` for each branch:
-
-**`main`**
-- Require pull request reviews (minimum 2 approvals)
-- Require status checks: `Bicep Lint`, `What-If`
-- Restrict pushes to platform team
-- No force pushes
-
-**`staging`**
-- Require pull request reviews (minimum 1 approval)
-- Require status checks: `Bicep Lint`
-
-**`dev`**
-- Require status checks: `Bicep Lint`
-
-### Workflow
-
-```
-feature/my-change ──► dev ──► staging ──► main
-                      │          │          │
-                      ▼          ▼          ▼
-                   dev env   staging env  prod env
-```
-
----
-
-## GitHub Secrets Reference
-
-| Secret | Description | Example |
+| Module | Path | Description |
 |---|---|---|
-| `AZURE_TENANT_ID` | Entra ID tenant GUID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| `AZURE_CLIENT_ID` | Service principal client ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| `MANAGEMENT_SUBSCRIPTION_ID` | Management sub ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| `CONNECTIVITY_SUBSCRIPTION_ID` | Connectivity sub ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| `IDENTITY_SUBSCRIPTION_ID` | Identity sub ID | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` |
-| `EA_BILLING_ACCOUNT` | EA billing account number | `12345678` |
-| `EA_ENROLLMENT_ACCOUNT` | EA enrollment account number | `987654` |
-| `CHECKPOINT_ADMIN_PASSWORD` | Checkpoint VM password | _(strong password)_ |
-| `SENTINEL_SECURITY_CONTACT` | SOC alert email | `soc@company.com.au` |
-| `LOG_ANALYTICS_WORKSPACE_ID` | LAW resource ID | `/subscriptions/.../workspaces/law-...` |
-| `HUB_VNET_ID` | Hub VNet resource ID | `/subscriptions/.../virtualNetworks/vnet-hub-...` |
-| `ROUTE_TABLE_ID` | UDR resource ID | `/subscriptions/.../routeTables/udr-...` |
-| `OPS_ALERT_EMAIL` | Platform ops team email | `platform-ops@company.com.au` |
-| `ER_CIRCUIT_RESOURCE_ID` | ExpressRoute circuit resource ID | `/subscriptions/.../expressRouteCircuits/erc-...` |
-| `CHECKPOINT_VM_RESOURCE_ID` | Checkpoint VM resource ID | `/subscriptions/.../virtualMachines/vm-checkpoint-...` |
+| RBAC Assignments | `platform/security/modules/rbac-assignments.bicep` | Centralised role assignment module with principal type enforcement |
+| Resource Lock | `platform/security/modules/resource-lock.bicep` | CanNotDelete lock applied to platform resource groups |
+| Private Endpoint | `platform/security/modules/private-endpoint.bicep` | Private endpoint for Key Vault and immutable storage accounts |
+
+### Subscription Vending Sub-Modules
+
+| Module | Path | Description |
+|---|---|---|
+| Defender Plan | `subscription-vending/modules/defender-plan.bicep` | Enables selected Defender for Cloud plans on vended subscriptions |
+| Subscription Budget | `subscription-vending/modules/subscription-budget.bicep` | Budget alerts at 80%, 100%, and 120% of monthly AUD estimate |
+| Subscription Diagnostics | `subscription-vending/modules/subscription-diagnostics.bicep` | Subscription-level diagnostic settings forwarded to central Log Analytics |
+| Subscription Lock | `subscription-vending/modules/subscription-lock.bicep` | CanNotDelete lock on the networking resource group of each spoke |
 
 ---
 
-## Networking Reference
+## Compliance
 
-### Address Space Summary
+This landing zone is designed to support WA Health obligations under the following regulatory and policy frameworks. See **[docs/security-baseline.md](docs/security-baseline.md)** for the full control mapping and evidence register.
 
-| Network | CIDR | Location | Notes |
-|---|---|---|---|
-| Hub VNet | `10.0.0.0/16` | Connectivity sub | Core hub — all traffic through Checkpoint |
-| Checkpoint external subnet | `10.0.0.0/28` | Hub | eth0 NIC + Public IP |
-| Checkpoint internal subnet | `10.0.1.0/28` | Hub | eth1 NIC — static .4 |
-| Management subnet | `10.0.2.0/24` | Hub | Jump servers (on-prem access via ER) |
-| GatewaySubnet | `10.0.3.0/27` | Hub | ExpressRoute Gateway |
-| Identity VNet | `10.10.0.0/16` | Identity sub | AD DS domain controllers |
-| Corp spokes | `10.100.0.0/16+` | Spoke subs | Vended — allocate sequentially |
-| Online spokes | `10.200.0.0/16+` | Spoke subs | Vended — allocate sequentially |
+### APRA CPS 234 — Information Security
 
-### Traffic Flow (Spoke → Internet)
+| Control Area | Implementation |
+|---|---|
+| Information security capability | Centralised platform team ownership; policies enforce baseline at every subscription |
+| Policy framework | Azure Policy (28 assignments) enforces security baseline automatically |
+| Implementation of controls | Defender for Cloud plans deployed to every vended subscription via DINE policy |
+| Incident response | Microsoft Sentinel with 6 analytics rules; HSP threat detection package |
+| Testing of controls | Checkov SAST on every pipeline run; Defender for Cloud secure score tracked |
+| Internal audit | Immutable audit log storage (WORM) on management subscription; 365-day LAW retention |
+| Notification to APRA | Sentinel incident workflow triggers SOC action group for reportable incidents |
 
-```
-Spoke VM  →  UDR (0.0.0.0/0)  →  Checkpoint eth1 (10.0.1.4)
-          →  Checkpoint inspects / allows / blocks
-          →  Checkpoint eth0 (10.0.0.4)  →  Internet via PIP
-```
+### Australian Government Information Security Manual (ISM)
 
-### Traffic Flow (On-Prem → Azure Spoke)
+| Control Area | Implementation |
+|---|---|
+| Asset management | Mandatory tags enforced by policy: `environment`, `dataClassification`, `costCenter`, `ownerEmail` |
+| Network segmentation | Hub-and-spoke with mandatory NVA inspection; UDR bypass not permitted |
+| Cryptography | ExpressRoute Direct with MACsec (L2 encryption); CMK on Log Analytics; Key Vault HSM |
+| Access control | RBAC enforced via policy; no classic administrators; no custom owner roles |
+| Audit logging | All resources send diagnostics to central Log Analytics; activity logs forwarded per subscription |
+| Patching | Azure Update Manager enforced via DINE policy on all vended subscriptions |
+| Multi-factor authentication | Enforced via Entra ID Conditional Access (outside scope of this repo) |
 
-```
-On-prem  →  ER circuit  →  ER Gateway (ergw-hub)
-         →  Hub VNet    →  VNet Peering  →  Spoke VNet
-```
+### Essential Eight Maturity Level 2
+
+| Strategy | Implementation |
+|---|---|
+| Application control | Defender for Endpoint deployed to all subscriptions; policy blocks unsigned extensions |
+| Patch applications | Update Manager configured via DINE policy; 48-hour patch window enforced |
+| Configure macros | Not applicable to Azure IaaS/PaaS workloads |
+| User application hardening | Defender for Cloud recommendations surfaced per subscription |
+| Restrict administrative privileges | Azure Policy denies custom owner roles; privileged role assignments alerted in Sentinel |
+| Patch operating systems | Update Manager enforced; guest configuration policy audits compliance |
+| Multi-factor authentication | Enforced via Entra ID (Conditional Access outside this repo scope) |
+| Regular backups | Backup policy enforced via Azure Policy DINE on vended subscriptions |
 
 ---
 
-## Post-Deployment Checklist
+## Security
 
-### Platform
+### Secrets Management
 
-- [ ] Run workflow 01 — verify management group hierarchy in Azure Portal
-- [ ] Run workflow 02 — note `LOG_ANALYTICS_WORKSPACE_ID` output and update secret
-- [ ] Run workflow 03 — note `HUB_VNET_ID` and `ROUTE_TABLE_ID` outputs and update secrets
-- [ ] Send ExpressRoute service key to provider; monitor circuit provisioning status
-- [ ] Complete Checkpoint First Time Configuration wizard (via on-prem jump host over ER)
-- [ ] Register Checkpoint gateway with SmartConsole and install base policy
-- [ ] Apply BYOL licence to Checkpoint via SmartConsole
-- [ ] Run workflow 05 — verify Sentinel is enabled in Azure Portal (`Microsoft Sentinel`)
+All sensitive values are managed exclusively through **Azure Key Vault Premium (HSM-backed)**. The following controls are in place:
 
-### Sentinel / Security
+- No secrets, passwords, connection strings, or credentials are stored in code, pipeline variables, or parameter files.
+- Pipeline authentication uses **OIDC Federated Credentials** (workload identity federation) — no client secrets are created or stored.
+- The Checkpoint VMSS admin password is generated at deployment time and stored in Key Vault; it is never passed as a pipeline variable in plaintext.
+- Key Vault is configured with private endpoint only (no public network access), HSM-backed keys, soft delete enabled, and purge protection enabled.
+- CMK (customer-managed key) is applied to the Log Analytics Workspace and immutable audit storage.
 
-- [ ] Validate all 8 data connectors show green status in Sentinel → Data connectors
-- [ ] Populate `TrustedIPRanges` watchlist with on-prem CIDR blocks
-- [ ] Configure TAXII threat intelligence feed URL
-- [ ] Assign `Microsoft Sentinel Contributor` to SOC team AAD group
-- [ ] Enable Microsoft Defender for Cloud Standard tier on all subscriptions
-- [ ] Test analytics rules by simulating a sign-in from an untrusted location
-- [ ] Review Automation Rules and assign SOC team as default incident owner
+### CI/CD Authentication
 
-### Governance
+Azure DevOps pipelines authenticate to Azure using **OIDC Workload Identity Federation**:
 
-- [ ] Review and assign Azure Policy initiatives at each management group
-- [ ] Enable Microsoft Defender for Cloud across all subscriptions
-- [ ] Configure Cost Management budgets and alerts per subscription
-- [ ] Set up Azure Monitor alerts for platform health (ER circuit, Checkpoint VM)
+1. A service principal is registered in Entra ID with no client secret.
+2. A federated credential is configured that trusts tokens issued by Azure DevOps for this specific organisation, project, and pipeline.
+3. Pipelines exchange a short-lived Azure DevOps OIDC token for an Azure access token at runtime — no long-lived credentials exist anywhere.
+
+See the bootstrap script at `scripts/bootstrap.ps1` for setup instructions.
+
+### Static Analysis
+
+Every pull request and pipeline run executes:
+
+| Tool | What it checks | Configuration |
+|---|---|---|
+| **Checkov** | Bicep and ARM template misconfigurations, insecure defaults, compliance violations | `.checkov.yaml` |
+| **Gitleaks** | Secrets, API keys, connection strings, and credentials committed to the repository | `.gitleaks.toml` |
+| **Bicep linter** | Syntax errors, best-practice violations, unused parameters | `bicepconfig.json` |
+
+### Network Security Controls
+
+- All spoke traffic is routed through the Checkpoint CloudGuard VMSS cluster via UDR — there is no mechanism to bypass NVA inspection.
+- The Checkpoint VMSS cluster operates in **Load Sharing Multicast** mode (active-active, 2 instances). If one instance becomes unhealthy, traffic routes to the remaining instance automatically.
+- ExpressRoute Direct uses **MACsec** (IEEE 802.1AE) for Layer 2 encryption of all traffic between the on-premises edge and the Microsoft Enterprise Edge (MSEE).
+- 28 Private DNS zones are deployed in the hub and linked to the hub VNet. Spoke VNets resolve private endpoints via VNet peering (no separate DNS links required per spoke).
+- NSGs are applied to all subnets including the Checkpoint external and internal subnets with least-privilege inbound and outbound rules.
+
+### Vulnerability Reporting
+
+To report a security vulnerability in this codebase, see **[SECURITY.md](SECURITY.md)**. Do not raise a public GitHub issue for security vulnerabilities.
 
 ---
 
 ## Contributing
 
-1. Branch from `dev` for all changes
-2. Follow the PR template
-3. Bicep changes must pass lint and what-if before review
-4. Infrastructure changes to `platform/` require 2 approvals
-5. New subscription vending files require security + network team approval
+### Branch Strategy
 
-## Licence
+All changes follow a promotion-based branching model:
 
-Internal use only — HSS platform team.
+```
+feature/<name>  ──►  dev  ──►  staging  ──►  main
+                      │           │             │
+                      ▼           ▼             ▼
+                   dev env   staging env    prod env
+```
+
+| Branch | Purpose | Deploys to | Protection |
+|---|---|---|---|
+| `main` | Production-ready — single source of truth | Production Azure environment | 2 approvals, status checks, no force push |
+| `staging` | Pre-production validation | Staging Azure environment | 1 approval, Bicep lint check |
+| `dev` | Active development and feature work | Dev Azure environment | Bicep lint check |
+| `feature/*` | Individual feature branches | No automatic deployment | None |
+
+### Pull Request Requirements
+
+All changes to `platform/` or `subscription-vending/` must satisfy the following before merge:
+
+- [ ] Bicep linter passes with zero errors (warnings must be reviewed)
+- [ ] Checkov scan passes — all CRITICAL and HIGH findings resolved
+- [ ] Gitleaks scan passes — no secrets detected
+- [ ] ARM what-if output reviewed and attached to PR
+- [ ] Changes to `platform/connectivity/` require network team review
+- [ ] Changes to `platform/sentinel/` or `platform/security/` require security team review
+- [ ] Changes to `platform/policies/` require platform lead review
+- [ ] All changes to `main` require a minimum of 2 approvals from platform team leads
+
+### Commit Standards
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/) format:
+
+```
+feat(connectivity): add PEZ secondary hub VNet peering
+fix(sentinel): correct analytics rule query for brute-force detection
+docs(expressroute): update circuit creation runbook for MACsec
+chore(deps): update AVM lz-vending module to 2.4.0
+```
+
+### Adding a New Spoke Subscription
+
+Use the vending script to scaffold the parameter file, then open a pull request:
+
+```powershell
+./scripts/new-subscription.ps1 `
+    -SubscriptionAlias   "sub-<application>-<environment>" `
+    -DisplayName         "<Application> — <Environment>" `
+    -TargetMG            "alz-landingzones-corp" `
+    -SpokeAddressPrefix  "10.101.0.0/16" `
+    -OwnerEmail          "<team>@health.wa.gov.au" `
+    -OwnerGroupObjectId  "<azure-ad-group-object-id>"
+```
+
+The validation script runs automatically on PR creation and checks for IP address space conflicts, naming convention compliance, and mandatory tag presence. See the pipeline for the three-team approval gate process (network, security, platform leads).
+
+---
+
+## License
+
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+
+Internal use: Western Australian Department of Health — Health Support Services (HSS).
+
+---
+
+## Contact
+
+| Role | Contact |
+|---|---|
+| Platform Engineering Team | platform-engineering@health.wa.gov.au *(update with actual address)* |
+| Security Operations Centre (SOC) | soc@health.wa.gov.au *(update with actual address)* |
+| Network Team | network-team@health.wa.gov.au *(update with actual address)* |
+| Vulnerability Reporting | See [SECURITY.md](SECURITY.md) |
+
+For general questions about the platform, raise an issue in Azure DevOps (DD03) using the platform support request template.

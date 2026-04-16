@@ -1,105 +1,50 @@
-## Pull Request — HSS Azure Landing Zone
+## Summary
 
-### Type of Change
-<!-- Check all that apply -->
-- [ ] 🆕 New subscription vending (`.bicepparam` file added)
-- [ ] 🔧 Platform change (management groups / logging / connectivity / sentinel)
-- [ ] 🔒 Security / policy update
-- [ ] 🐛 Bug fix
-- [ ] 📖 Documentation only
-- [ ] ♻️ Refactor (no functional change)
+<!-- Describe WHAT changed and WHY. Link to the GitHub Issue or design decision. -->
 
----
-
-### Linked Issue
-<!-- For subscription vending PRs, link the approved GitHub Issue -->
 Closes #<!-- issue number -->
 
----
+## Type of Change
 
-## Subscription Vending Checklist
-<!-- Complete this section only for PRs adding a new .bicepparam file -->
-<!-- Skip for non-vending PRs -->
+- [ ] 🔧 Bug fix (non-breaking)
+- [ ] ✨ New feature / module
+- [ ] 💥 Breaking change (module interface or topology change)
+- [ ] 📋 Policy change
+- [ ] 🔒 Security hardening
+- [ ] 📝 Documentation only
+- [ ] 🔄 Refactor (no functional change)
 
-<details>
-<summary>Click to expand subscription vending checklist</summary>
+## Checklist
 
-#### 1. Identity & Ownership
-- [ ] Subscription alias follows naming convention: `sub-<appname>-<env>` (lowercase, hyphens only)
-- [ ] Display name is descriptive and matches the linked Issue
-- [ ] AAD group Object ID verified — group exists and contains correct members
-- [ ] Owner email is a valid distribution list (not an individual)
-- [ ] Cost centre / business unit tag populated
+### Code Quality
+- [ ] Bicep lint passes locally (`az bicep lint --file <file>`)
+- [ ] No hardcoded IPs or passwords in any file
+- [ ] All new params have `@description()` decorators
+- [ ] All new string params with known patterns have `@pattern()` validators
+- [ ] `effectiveTags` / `tags` applied to all new resources
 
-#### 2. Management Group Placement
-- [ ] Target MG is appropriate:
-  - `alz-landingzones-corp` → private / internal workloads
-  - `alz-landingzones-online` → internet-facing workloads
-  - `alz-sandbox` → experimental only
-- [ ] Workload type (`Production` / `DevTest`) is set correctly
+### Security
+- [ ] No secrets committed (Gitleaks scan passes)
+- [ ] Checkov scan passes (or suppressions documented in `.checkov.yaml`)
+- [ ] New resources have diagnostic settings → Log Analytics
+- [ ] New critical resources have CanNotDelete resource lock
 
-#### 3. Networking
-- [ ] Spoke CIDR is a /16 and does not overlap with:
-  - [ ] Hub: `10.0.0.0/16`
-  - [ ] Identity: `10.10.0.0/16`
-  - [ ] All existing corp spokes (`10.100.x.0/16` — `10.199.x.0/16`)
-  - [ ] All existing online spokes (`10.200.x.0/16` — `10.254.x.0/16`)
-- [ ] Subnet CIDRs are within the spoke CIDR
-- [ ] Route table ID points to hub UDR (`udr-to-checkpoint-001`)
-- [ ] Hub VNet ID is correct (matches `HUB_VNET_ID` secret)
-- [ ] `useRemoteGateways: true` — traffic uses ExpressRoute via hub
+### Testing
+- [ ] What-if run completed and output reviewed (paste summary below)
+- [ ] Tested in `dev` branch before raising to `main`
+- [ ] No unexpected resource deletions in what-if output
 
-#### 4. Security & Compliance
-- [ ] Data classification documented in tags
-- [ ] Defender for Cloud plan selected appropriately
-- [ ] Budget alert threshold set (`budgetAmountAUD` parameter)
-- [ ] Compliance tags populated (APRA / ISM / Essential Eight as applicable)
-
-#### 5. What-If Review
-- [ ] What-if output has been reviewed (see workflow run comments below)
-- [ ] No unexpected resource deletions or modifications shown in what-if
-- [ ] Deployment scope (management group) is correct
-
-#### 6. Approvals Required
-- [ ] ✅ **Platform Team** — architecture + naming + MG placement (`@platform-team`)
-- [ ] ✅ **Network Team** — IP allocation confirmed (`@network-team`)
-- [ ] ✅ **Security Team** — access + compliance + Defender plan (`@security-team`)
-
-</details>
-
----
-
-## Platform Change Checklist
-<!-- Complete this section for non-vending platform changes -->
-
-- [ ] Bicep lint passes locally (`az bicep build --file <file>`)
-- [ ] What-if reviewed — changes are expected and understood
-- [ ] No hardcoded subscription IDs, passwords, or secrets
-- [ ] Diagnostic settings included on all new resources
-- [ ] Resource tags applied consistently
-- [ ] Outputs exposed for downstream modules
-
----
+### Documentation
+- [ ] `CHANGELOG.md` updated with this change
+- [ ] Runbook / docs updated if operational steps changed
+- [ ] `docs/avm-module-versions.md` updated if AVM versions changed
 
 ## What-If Summary
-<!-- Paste key lines from the what-if output, or link to the Actions run -->
 
 ```
-Paste what-if output here or reference the Actions run link
+<!-- Paste abbreviated az deployment what-if output here -->
 ```
-
----
-
-## Testing Evidence
-<!-- How has this change been validated? -->
-
-- Environment tested in: `dev` / `staging`
-- Actions run link: <!-- link -->
-
----
 
 ## Rollback Plan
-<!-- How do we revert if this causes issues in production? -->
 
-- Revert PR: this PR can be reverted via `git revert`
-- Impact of revert: <!-- describe -->
+<!-- What is the safe rollback if this breaks production? -->

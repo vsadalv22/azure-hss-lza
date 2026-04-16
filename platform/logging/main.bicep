@@ -46,11 +46,20 @@ param immutableStorageAccountId string = ''
 @minValue(365)
 param retentionInDays int = 365
 
+// ── Effective Tags — merges caller-supplied tags with mandatory platform tags ──
+// Mandatory tags are always applied regardless of what the caller passes.
+// This ensures compliance with the require-tags-on-rg policy (GOV-02).
+var effectiveTags = union(tags, {
+  managedBy : 'platform-team'
+  createdBy : 'alz-bicep'
+  deployedAt: utcNow('yyyy-MM-dd')   // Deployment timestamp for audit trail
+})
+
 // ---- Resource Group ----
 resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
   name: 'rg-management-logging-001'
   location: location
-  tags: tags
+  tags: effectiveTags
 }
 
 // ============================================================
@@ -62,7 +71,7 @@ resource rg 'Microsoft.Resources/resourceGroups@2023-07-01' = {
 resource lawManagedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'id-law-cmk-aue-001'
   location: location
-  tags: tags
+  tags: effectiveTags
 }
 
 // ---- Log Analytics Workspace ----
@@ -74,7 +83,7 @@ module logAnalytics 'br/public:avm/res/operational-insights/workspace:0.9.0' = {
     location: location
     skuName: logAnalyticsSku
     dataRetention: retentionInDays
-    tags: tags
+    tags: effectiveTags
     linkedStorageAccounts: []
 
     // Workspace-level access control — require explicit table/resource permissions.
@@ -156,7 +165,7 @@ module automationAccount 'br/public:avm/res/automation/automation-account:0.11.0
     name: automationAccountName
     location: location
     skuName: 'Basic'
-    tags: tags
+    tags: effectiveTags
     linkedWorkspace: {
       id: logAnalytics.outputs.resourceId
     }

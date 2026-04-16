@@ -14,6 +14,10 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true   # Safe to cancel — security scans can restart on new pushes
+
 permissions:
   contents: read
   security-events: write  # Required for Checkov SARIF upload

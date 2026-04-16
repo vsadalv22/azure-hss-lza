@@ -57,3 +57,5 @@ param tags = {
 
 // Set to false only during initial development/testing — always true in production
 param enableResourceLocks = true
+
+param deployPrivateDnsZones = true

@@ -38,6 +38,36 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# ── Prerequisites Check ──────────────────────────────────────
+Write-Host "`n[PRE-FLIGHT] Checking prerequisites..." -ForegroundColor Cyan
+
+$prereqs = @{
+    'Azure CLI'     = { az --version 2>$null | Select-String 'azure-cli' }
+    'Bicep CLI'     = { az bicep version 2>$null }
+    'Git'           = { git --version 2>$null }
+    'PowerShell 7+' = { $PSVersionTable.PSVersion.Major -ge 7 }
+}
+
+$allPassed = $true
+foreach ($name in $prereqs.Keys) {
+    try {
+        $result = & $prereqs[$name]
+        if ($result) {
+            Write-Host "  ✅ $name : Found" -ForegroundColor Green
+        } else {
+            Write-Host "  ❌ $name : NOT FOUND" -ForegroundColor Red
+            $allPassed = $false
+        }
+    } catch {
+        Write-Host "  ❌ $name : Error checking - $_" -ForegroundColor Red
+        $allPassed = $false
+    }
+}
+
+if (-not $allPassed) {
+    throw "One or more prerequisites are missing. Install them before running bootstrap."
+}
+
 # ---- Login ----
 Write-Host "`n[1/6] Connecting to Azure tenant $TenantId..." -ForegroundColor Cyan
 Connect-AzAccount -TenantId $TenantId
@@ -131,3 +161,34 @@ Write-Host ""
 Write-Host "  Configure at: https://github.com/$GitHubOrg/$GitHubRepo/settings/environments" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "Bootstrap complete! Next step: run workflow 01-platform-management-groups" -ForegroundColor Green
+
+# ── Bootstrap Summary ────────────────────────────────────────
+Write-Host ""
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
+Write-Host "  BOOTSTRAP SUMMARY — Resources Created" -ForegroundColor Cyan
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  App Registration" -ForegroundColor White
+Write-Host ("    Display Name : {0}" -f $AppDisplayName)
+Write-Host ("    Client ID    : {0}" -f $app.AppId)
+Write-Host ("    Object ID    : {0}" -f $sp.Id)
+Write-Host ""
+Write-Host "  Federated Credentials (GitHub OIDC — no client secrets)" -ForegroundColor White
+foreach ($fc in $federatedCredentials) {
+    Write-Host ("    {0,-20} -> {1}" -f $fc.name, $fc.subject)
+}
+Write-Host ""
+Write-Host "  RBAC Assignments" -ForegroundColor White
+Write-Host "    Owner                        on Tenant Root MG"
+Write-Host "    Management Group Contributor on Tenant Root MG"
+foreach ($subId in @($ManagementSubId, $ConnectivitySubId, $IdentitySubId)) {
+    Write-Host ("    Owner                        on /subscriptions/{0}" -f $subId)
+}
+Write-Host ""
+Write-Host "  Next Steps" -ForegroundColor White
+Write-Host "    1. Set GitHub secrets listed above in your repository"
+Write-Host "    2. Create GitHub Environments: platform-production, subscription-vending"
+Write-Host "    3. Manually assign EA Enrollment Account Subscription Creator role"
+Write-Host "    4. Run: gh workflow run 01-platform-management-groups.yml --ref main"
+Write-Host ""
+Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray

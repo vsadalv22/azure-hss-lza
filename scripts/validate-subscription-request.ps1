@@ -197,6 +197,68 @@ else {
     } else {
         Warn "budgetAmountAUD not set — defaulting to AUD 5,000/month. Update if higher spend expected."
     }
+
+    # ── 8. Data Classification vs Defender Plans ───────────────
+    Write-Host ""
+    Write-Host "── [8] Data Classification vs Defender Plans ───────────────"
+    $dataClass = Get-ParamValue $lines 'dataClassification'
+    $enableDefenderServers = Get-ParamValue $lines 'enableDefenderServers'
+
+    if ($dataClass -in @('CONFIDENTIAL', 'HIGHLY_CONFIDENTIAL')) {
+        if ($enableDefenderServers -ne 'true') {
+            Fail "Data classification '$dataClass' requires enableDefenderServers = true"
+        } else {
+            Pass "Defender for Servers enabled for $dataClass workload"
+        }
+    } else {
+        Pass "Data classification '$dataClass' — Defender for Servers optional"
+    }
+
+    # ── 9. HSP ID Tag Validation (DD40) ─────────────────────────
+    Write-Host ""
+    Write-Host "── [9] HSP ID Tag Validation (DD40) ────────────────────────"
+    $validHspIds = @('perth-childrens', 'fiona-stanley', 'rpbg', 'smhs', 'nmhs', 'platform')
+    $hspId = Get-ParamValue $lines 'hspId'
+    if ([string]::IsNullOrEmpty($hspId)) {
+        Fail "Missing hsp-id tag — required for Sentinel data segregation (DD40)"
+    } elseif ($hspId -notin $validHspIds) {
+        Warn "hsp-id '$hspId' not in approved HSP list: $($validHspIds -join ', '). Verify with Platform team."
+    } else {
+        Pass "HSP ID '$hspId' is valid"
+    }
+
+    # ── 10. Owner Email Format Validation ────────────────────────
+    Write-Host ""
+    Write-Host "── [10] Owner Email Format ──────────────────────────────────"
+    $ownerEmailFmt = Get-ParamValue $lines 'ownerEmail'
+    $emailPattern = '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    if ([string]::IsNullOrEmpty($ownerEmailFmt)) {
+        Fail "ownerEmail is required"
+    } elseif ($ownerEmailFmt -notmatch $emailPattern) {
+        Fail "ownerEmail '$ownerEmailFmt' is not a valid email address"
+    } elseif ($ownerEmailFmt -like '*@outlook.com' -or $ownerEmailFmt -like '*@gmail.com') {
+        Warn "ownerEmail '$ownerEmailFmt' appears to be a personal account — use a health.wa.gov.au distribution list"
+    } else {
+        Pass "ownerEmail format valid: $ownerEmailFmt"
+    }
+
+    # ── 11. Management Group vs Subscription Type ────────────────
+    Write-Host ""
+    Write-Host "── [11] Management Group vs Subscription Type ───────────────"
+    $targetMgCheck = Get-ParamValue $lines 'targetManagementGroupId'
+    $subWorkload   = Get-ParamValue $lines 'subscriptionWorkload'
+
+    $corpMgs    = @('alz-landingzones-corp')
+    $onlineMgs  = @('alz-landingzones-online')
+    $sandboxMgs = @('alz-sandbox')
+
+    if ($subWorkload -eq 'Production' -and $targetMgCheck -in $sandboxMgs) {
+        Fail "Production workload cannot be placed in sandbox management group '$targetMgCheck'"
+    } elseif ($subWorkload -eq 'DevTest' -and $targetMgCheck -in $corpMgs -and $dataClass -in @('HIGHLY_CONFIDENTIAL')) {
+        Warn "DevTest subscription with HIGHLY_CONFIDENTIAL data in Corp MG — verify with security team"
+    } else {
+        Pass "Management group '$targetMgCheck' appropriate for workload type '$subWorkload'"
+    }
 }
 
 # ── Summary ────────────────────────────────────────────────────
@@ -212,6 +274,20 @@ Write-Host "  Passed  : $($passes.Count)"
 Write-Host "  Warnings: $($warnings.Count)"
 Write-Host "  Failed  : $($failures.Count)"
 Write-Host "═══════════════════════════════════════════════════════════"
+
+# ── Machine-readable output for pipeline parsing ──────────────
+$summaryObj = [pscustomobject]@{
+    ValidationPassed = ($failures.Count -eq 0)
+    FailureCount     = $failures.Count
+    WarningCount     = $warnings.Count
+    PassCount        = $passes.Count
+    Timestamp        = (Get-Date -Format 'o')
+    ParamFile        = $ParamFile
+}
+Write-Output ""
+Write-Output "##[group]Validation JSON Summary"
+Write-Output ($summaryObj | ConvertTo-Json)
+Write-Output "##[endgroup]"
 
 if ($failures.Count -gt 0) {
     Write-Host ""

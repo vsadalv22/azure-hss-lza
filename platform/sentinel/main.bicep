@@ -37,6 +37,7 @@ param enableHealthDiagnostics bool = true
 param tenantId string = tenant().tenantId
 
 @description('Sentinel security contact email')
+@pattern('^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$')
 param securityContactEmail string
 
 @description('Resource tags')
@@ -52,6 +53,15 @@ param enableHspDataSegregation bool = true
 
 @description('DD40 — List of HSP names for table-level RBAC (e.g. [\'perth-childrens\', \'fiona-stanley\', \'rpbg\'])')
 param hspList array = []
+
+// ── Effective Tags — merges caller-supplied tags with mandatory platform tags ──
+// Mandatory tags are always applied regardless of what the caller passes.
+// This ensures compliance with the require-tags-on-rg policy (GOV-02).
+var effectiveTags = union(tags, {
+  managedBy : 'platform-team'
+  createdBy : 'alz-bicep'
+  deployedAt: utcNow('yyyy-MM-dd')   // Deployment timestamp for audit trail
+})
 
 // ============================================================
 // Reference existing Log Analytics workspace (created by
@@ -597,7 +607,7 @@ resource tableSecurityEvent 'Microsoft.OperationalInsights/workspaces/tables@202
 resource dcrHspTagging 'Microsoft.Insights/dataCollectionRules@2023-03-11' = if (enableHspDataSegregation) {
   name: 'dcr-sentinel-hsp-tagging-001'
   location: location
-  tags: tags
+  tags: effectiveTags
   properties: {
     description: 'DD40 — Appends HSPTag column from resource tag hsp-id to Windows Security Events for HSP data segregation in Sentinel.'
     dataCollectionEndpointId: null
