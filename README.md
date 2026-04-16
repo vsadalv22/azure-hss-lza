@@ -282,9 +282,20 @@ The five-minute overview:
 
 ## Pipeline Deployment Sequence
 
-Run each pipeline stage in the order shown. Each stage depends on outputs from the previous.
+`00-security-checks` runs automatically on every PR and push — no manual action needed.
+All other pipelines run in the order shown for the **initial platform deployment**.
+After the platform is established, each pipeline runs independently on code changes to its
+source paths.
 
 ```
+┌─────────────────────────────────────────────────────────────────────┐
+│  00 — Security Checks  (every PR + push — no deployment)            │
+│  Pipeline: azure-pipelines/00-security-checks.yml                  │
+│  Runs:  Bicep lint  |  Checkov SAST  |  Gitleaks secrets scan       │
+│  Gate:  All checks must pass before any deployment pipeline runs    │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼ (on merge to main)
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Stage 1 — Management Groups                                        │
 │  Pipeline: azure-pipelines/01-management-groups.yml                 │
@@ -298,92 +309,71 @@ Run each pipeline stage in the order shown. Each stage depends on outputs from t
 │  Stage 2 — Logging                                                   │
 │  Pipeline: azure-pipelines/02-logging.yml                           │
 │  Scope: Management subscription                                      │
-│  Deploys: Log Analytics Workspace (CMK), Automation Account         │
-│  Output: Log Analytics workspace resource ID (→ config/inputs.yaml) │
+│  Deploys: Log Analytics Workspace, Automation Account,              │
+│           LAW Managed Identity (for CMK — activated later)          │
+│  → Update alz-platform-secrets: LOG_ANALYTICS_WORKSPACE_ID,        │
+│    LAW_MI_PRINCIPAL_ID                                               │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 3 — Security Baseline                                        │
-│  Pipeline: azure-pipelines/03-security.yml                          │
-│  Scope: Management subscription                                      │
-│  Deploys: Key Vault Premium/HSM, immutable audit storage (WORM)     │
-│  Output: Key Vault URI (used by all subsequent stages)               │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 4 — Connectivity                                              │
-│  Pipeline: azure-pipelines/04-connectivity.yml                      │
+│  Stage 3 — Connectivity                                              │
+│  Pipeline: azure-pipelines/03-connectivity.yml                      │
 │  Scope: Connectivity subscription                                    │
-│  Deploys: Hub VNet, Ingress VNet, Checkpoint VMSS cluster,          │
-│           ER Gateway, Private DNS zones (28), PEZ secondary hub     │
-│  Output: Hub VNet ID, Checkpoint LB IP, ER Gateway ID               │
-│                                                                     │
-│  *** MANUAL STEP — Network team creates ExpressRoute Direct         │
-│      circuit with MACsec in Azure Portal and sends service key      │
-│      to provider. See: docs/expressroute-setup.md                   │
-│      Wait for ProviderState = Provisioned (typically 1–5 days)      │
-│      Update inputs.yaml with circuit resource ID, then run          │
-│      Stage 4b to link the ER Gateway to the circuit.                │
+│  Deploys: Hub VNet, Ingress VNet, Checkpoint CloudGuard VMSS (2x), │
+│           ER Gateway (zone-redundant), 28 Private DNS zones,        │
+│           PEZ secondary hub (Perth Extended Zone)                   │
+│  → Update alz-platform-secrets: HUB_VNET_ID, ER_GATEWAY_ID,       │
+│    MANAGEMENT_SUBNET_ID, ROUTE_TABLE_ID                             │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 4b — ER Connection  (manual trigger only)                    │
-│  Pipeline: azure-pipelines/04b-er-connection.yml                    │
+│  Stage 3a — Platform Security                                        │
+│  Pipeline: azure-pipelines/06-platform-security.yml                 │
+│  Scope: Management subscription                                      │
+│  Deploys: Key Vault Premium/HSM, immutable audit storage (WORM),   │
+│           private endpoints (uses MANAGEMENT_SUBNET_ID from Stage 3)│
+│  Post-deploy: grants Key Vault Crypto User to LAW managed identity  │
+│  *** Re-run pipeline 02 after this step to activate CMK on LAW ***  │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Stage 3b — ER Connection  (manual trigger only)                    │
+│  Pipeline: azure-pipelines/03b-er-connection.yml                    │
 │  Scope: Connectivity subscription                                    │
 │  Pre-flight: Validates ProviderState = Provisioned before deploying │
-│  Deploys: ER Gateway ↔ Circuit connection resource                  │
+│  Deploys: ER Gateway ↔ Circuit connection resource (BFD enabled)    │
 │  Output: BGP routes established, on-premises connectivity live       │
 │                                                                     │
-│  *** MANUAL STEP — Complete Checkpoint first-boot configuration.    │
-│      SSH to Checkpoint VMSS instances from on-premises jump host    │
-│      over ExpressRoute. See: docs/checkpoint-first-boot.md          │
+│  *** MANUAL STEP — Network team creates ExpressRoute Direct circuit │
+│      with MACsec in Azure Portal and sends service key to provider. │
+│      See: docs/expressroute-setup.md                                 │
+│      Wait for ProviderState = Provisioned (typically 1–5 days).     │
+│      Then: docs/checkpoint-first-boot.md for Checkpoint first boot. │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 5 — Identity                                                  │
-│  Pipeline: azure-pipelines/05-identity.yml                          │
-│  Scope: Identity subscription                                        │
-│  Deploys: Identity VNet, subnets for AD DS, NSGs, VNet peering      │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 6 — Policies                                                  │
-│  Pipeline: azure-pipelines/06-policies.yml                          │
-│  Scope: Root management group                                        │
-│  Deploys: 28 policy assignments (deny, audit, DeployIfNotExists)     │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 7 — Sentinel                                                  │
-│  Pipeline: azure-pipelines/07-sentinel.yml                          │
+│  Stage 4 — Sentinel                                                  │
+│  Pipeline: azure-pipelines/05-sentinel.yml                          │
 │  Scope: Management subscription                                      │
-│  Deploys: Sentinel workspace enablement, 6 analytics rules,         │
-│           HSP scoping (Healthcare Sentinel Package)                 │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    │
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Stage 8 — Monitoring                                                │
-│  Pipeline: azure-pipelines/08-monitoring.yml                        │
-│  Scope: Management subscription                                      │
-│  Deploys: Action groups, platform alerts, Azure Monitor workbooks   │
+│  Deploys: Microsoft Sentinel enablement, 6 scheduled analytics      │
+│           rules, UEBA, HSP data scoping (Healthcare Sentinel Pkg)   │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Subscription Vending  (ongoing — triggered per spoke request)      │
-│  Pipeline: azure-pipelines/09-subscription-vending.yml              │
+│  Pipeline: azure-pipelines/04-subscription-vending.yml              │
 │  Scope: Root management group                                        │
-│  Trigger: PR adding a new parameter file to subscription-vending/   │
-│  Deploys: EA subscription, spoke VNet + peering, UDR, RBAC,        │
-│           Defender plans, budget alerts, diagnostic settings         │
-│  Approval: Network review → Security review → Platform lead sign-off│
+│  Trigger: PR adding a new .bicepparam file to                        │
+│           subscription-vending/parameters/                          │
+│  Deploys: EA subscription, spoke VNet + hub peering, UDR, RBAC,    │
+│           Defender plans, budget alerts, diagnostic settings,        │
+│           CanNotDelete lock on networking resource group             │
+│  Approval: Network review → Security review → Platform lead (3-way) │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 

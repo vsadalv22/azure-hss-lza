@@ -8,27 +8,40 @@ the enterprise DevSecOps platform mandated by DD03 / DD04 using Azure DevOps.
 
 ## Pipeline Overview and Execution Order
 
-Pipelines must be run in the following order for initial platform deployment.
-After the platform is established, each pipeline can run independently on code changes.
+`00-security-checks` runs automatically on every PR and push — it is a gate, not a
+deployment pipeline. All other pipelines must be run in the order shown below for
+the initial platform deployment. After the platform is established, each pipeline
+can run independently when its source paths change.
 
 ```
+00-security-checks     (every PR + push to main/staging/prod — no deployment)
+        │
+        ▼
 01-management-groups   (tenant scope — run once)
-        |
-        v
+        │
+        ▼
 02-logging             (management subscription — run once)
-        |
-        v
+        │
+        ▼
 03-connectivity        (connectivity subscription — run once)
-        |
-        v
+        │
+        ▼
+06-platform-security   (management subscription — run after 02 + 03)
+        │
+        ▼
 03b-er-connection      (manual trigger only — run after ER circuit is provisioned)
-        |
-        v
+        │
+        ▼
 04-subscription-vending  (on-demand — run per subscription request)
-        |
-        v
+        │
+        ▼
 05-sentinel            (management subscription — run once)
 ```
+
+> **Why 06 runs after 03?**  `06-platform-security` deploys the platform Key Vault and
+> immutable storage. It needs `HUB_VNET_ID` and `MANAGEMENT_SUBNET_ID` from pipeline 03
+> to attach private endpoints. After 06 completes, its Key Vault URI output is fed back
+> into pipeline 02 (re-run) to activate Customer-Managed Key (CMK) on Log Analytics.
 
 ---
 
@@ -36,12 +49,14 @@ After the platform is established, each pipeline can run independently on code c
 
 | File | Pipeline | Scope | Trigger |
 |------|----------|-------|---------|
+| `00-security-checks.yml` | Security Checks (lint + SAST + secrets scan) | N/A (no deployment) | Every PR to main/staging; push to main/staging/prod |
 | `01-management-groups.yml` | Management Group Hierarchy | Tenant | `platform/management-groups/**` push to main |
 | `02-logging.yml` | Log Analytics + Monitoring | Management subscription | `platform/logging/**` push to main |
-| `03-connectivity.yml` | Hub VNet + ER Gateway + Checkpoint NVA | Connectivity subscription | `platform/connectivity/**` push to main |
+| `03-connectivity.yml` | Hub VNet + ER Gateway + Checkpoint VMSS | Connectivity subscription | `platform/connectivity/**` push to main |
 | `03b-er-connection.yml` | ExpressRoute Connection | Connectivity subscription | Manual only (`trigger: none`) |
 | `04-subscription-vending.yml` | Subscription Vending Machine | Management group (EA) | `subscription-vending/parameters/**` push to main |
 | `05-sentinel.yml` | Microsoft Sentinel | Management subscription | `platform/sentinel/**` push to main |
+| `06-platform-security.yml` | Platform Security (Key Vault + WORM storage) | Management subscription | `platform/security/**` push to main |
 
 ---
 
@@ -93,7 +108,9 @@ Two variable groups must exist in **Pipelines > Library** before running any pip
 | `EA_BILLING_ACCOUNT` | EA billing account name | Manual |
 | `EA_ENROLLMENT_ACCOUNT` | EA enrollment account name | Manual |
 | `HUB_VNET_ID` | Full resource ID of the Hub VNet | **Set after running pipeline 03** |
+| `MANAGEMENT_SUBNET_ID` | Full resource ID of the management subnet in Hub VNet | **Set after running pipeline 03** |
 | `ROUTE_TABLE_ID` | Full resource ID of the Hub route table | **Set after running pipeline 03** |
+| `LAW_MI_PRINCIPAL_ID` | Principal ID of the Log Analytics managed identity (for CMK) | **Set after running pipeline 02** (lawManagedIdentityPrincipalId output) |
 | `SENTINEL_SECURITY_CONTACT` | Email address for Defender for Cloud security alerts | Manual |
 
 #### `alz-platform-variables` (non-secret configuration values)
@@ -118,7 +135,7 @@ before importing the pipelines.
 
 | Environment name | Required approvers | Used by pipeline(s) |
 |------------------|--------------------|---------------------|
-| `platform-production` | Platform team leads | 01, 02, 03, 03b, 05 |
+| `platform-production` | Platform team leads | 01, 02, 03, 03b, 05, 06 |
 | `vending-network-review` | Network team | 04 |
 | `vending-security-review` | Security / SOC team | 04 |
 | `vending-platform-approval` | Platform team leads | 04 |
@@ -137,7 +154,7 @@ To create an environment with approvals:
 
 ## Importing Pipelines into Azure DevOps
 
-Import all 6 pipeline YAML files in one session. The steps are identical for each.
+Import all 8 pipeline YAML files in one session. The steps are identical for each.
 
 ### Steps (repeat for each pipeline file)
 
@@ -156,12 +173,14 @@ Import all 6 pipeline YAML files in one session. The steps are identical for eac
 
 | YAML file | ADO pipeline name |
 |-----------|-------------------|
+| `00-security-checks.yml` | `00 - Security: Lint, SAST & Secrets Scan` |
 | `01-management-groups.yml` | `01 - Platform: Management Groups` |
 | `02-logging.yml` | `02 - Platform: Logging & Monitoring` |
 | `03-connectivity.yml` | `03 - Platform: Connectivity` |
 | `03b-er-connection.yml` | `03b - Platform: ExpressRoute Connection` |
 | `04-subscription-vending.yml` | `04 - Subscription Vending Machine` |
 | `05-sentinel.yml` | `05 - Platform: Microsoft Sentinel` |
+| `06-platform-security.yml` | `06 - Platform: Security (Key Vault + WORM)` |
 
 ---
 
@@ -206,10 +225,26 @@ After completion, copy these values from the pipeline output and update
 `alz-platform-secrets`:
 - `ER_GATEWAY_ID`
 - `HUB_VNET_ID`
+- `MANAGEMENT_SUBNET_ID`
 - `ROUTE_TABLE_ID`
 
-Then follow the manual ER circuit provisioning steps shown in the pipeline
-summary. See `docs/expressroute-setup.md` for the full runbook.
+### Step 3a — Platform Security (pipeline 06)
+
+Run this pipeline after steps 2 and 3 have both completed. It deploys the platform
+Key Vault (Premium / HSM-backed) and the immutable audit storage account (WORM).
+Private endpoints are attached to the management subnet created in step 3.
+
+```
+Run pipeline: 06 - Platform: Security (Key Vault + WORM)
+No parameters required.
+Approval gate: platform-production (platform team)
+```
+
+After completion:
+1. The pipeline automatically grants **Key Vault Crypto User** to the Log Analytics
+   managed identity (`LAW_MI_PRINCIPAL_ID` variable group entry — set after step 2).
+2. **Re-run pipeline 02** (Logging) to activate Customer-Managed Key (CMK) on the
+   Log Analytics Workspace using the Key Vault URI output from this pipeline.
 
 ### Step 3b — ExpressRoute Connection (pipeline 03b)
 
@@ -268,12 +303,14 @@ scope deployments:
 
 | Pipeline | Deployment scope | Required role |
 |----------|-----------------|---------------|
+| 00 | N/A (lint + scan only) | No Azure access required |
 | 01 | Tenant | Owner at Tenant Root Management Group |
 | 02 | Subscription | Contributor on Management subscription |
 | 03 | Subscription | Contributor on Connectivity subscription |
 | 03b | Resource Group | Contributor on Connectivity subscription |
 | 04 | Management Group | Management Group Contributor + EA Enrollment Account Owner |
 | 05 | Subscription | Contributor on Management subscription |
+| 06 | Subscription | Contributor on Management subscription + Key Vault Administrator (post-deploy role assignment) |
 
 ---
 
