@@ -98,7 +98,6 @@ Two variable groups must exist in **Pipelines > Library** before running any pip
 |----------|-------------|-----------------|
 | `AZURE_TENANT_ID` | Azure tenant ID | Manual |
 | `AZURE_CLIENT_ID` | Service principal client ID (app registration) | Manual |
-| `CHECKPOINT_ADMIN_PASSWORD` | Checkpoint NVA admin password (min 12 chars) | Manual |
 | `CONNECTIVITY_SUBSCRIPTION_ID` | Subscription ID for connectivity resources | Manual |
 | `MANAGEMENT_SUBSCRIPTION_ID` | Subscription ID for management/logging resources | Manual |
 | `IDENTITY_SUBSCRIPTION_ID` | Subscription ID for identity resources | Manual |

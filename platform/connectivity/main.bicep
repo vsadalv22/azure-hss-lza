@@ -4,16 +4,15 @@ targetScope = 'subscription'
 // Azure Landing Zone - Connectivity / Hub Networking
 // Region        : Australia East
 // Topology      : Hub & Spoke (Dual-VNet Security pattern)
-// NVA           : Checkpoint CloudGuard (VMSS cluster)
+// NVA           : Checkpoint CloudGuard — MANUAL DEPLOYMENT
 // WAN Edge      : ExpressRoute
 //
 // Design decisions implemented:
-//   DD30 — Checkpoint VMSS (replaces single NVA)
 //   DD31 — Dual Security VNet (hub/egress + ingress/DMZ VNets)
 //   DD23 — BGP Active/Active note (see ER Gateway section)
 //   DD34 — DDoS Protection Standard on both VNets
 //
-// VNet layout (default CIDRs — all subnets derived from hubVnetAddressPrefix/ingressVnetAddressPrefix):
+// VNet layout (default CIDRs — all subnets derived from params):
 //   vnet-hub-australiaeast-001     hubVnetAddressPrefix (/16)  — egress / hybrid
 //     snet-checkpoint-internal      cidrSubnet(/16, 12, 16)    — Checkpoint eth1 e.g. 10.0.1.0/28
 //     snet-management               cidrSubnet(/16,  8,  2)    — jump hosts       e.g. 10.0.2.0/24
@@ -23,15 +22,33 @@ targetScope = 'subscription'
 //     snet-checkpoint-external      cidrSubnet(/16, 12,  0)    — Checkpoint eth0  e.g. 10.1.0.0/28
 //     snet-ingress-dmz              cidrSubnet(/16,  8,  1)    — DMZ workloads    e.g. 10.1.1.0/24
 //
+// ──────────────────────────────────────────────────────────────
+// CHECKPOINT DEPLOYMENT — MANUAL ACTIVITY
+// ──────────────────────────────────────────────────────────────
+// This template intentionally does NOT deploy Checkpoint VMs or
+// VMSS. The VNets and subnets below are pre-created as the
+// network foundation. The Checkpoint NVA must be deployed
+// manually by the network team after the VNets are provisioned:
+//
+//   1. Deploy Checkpoint CloudGuard R81.10 from Azure Marketplace
+//      into the pre-created subnets:
+//        eth0 → snet-checkpoint-external  (vnet-ingress-australiaeast-001)
+//        eth1 → snet-checkpoint-internal  (vnet-hub-australiaeast-001)
+//   2. Assign the static Internal LB frontend IP = checkpointInternalIp output
+//      (cidrHost of snet-checkpoint-internal, index 4)
+//   3. Update the UDR (rt-to-checkpoint-hub-001) next-hop if the
+//      actual NVA IP differs from the derived default.
+//   4. Complete SmartConsole cluster configuration.
+//      See: docs/checkpoint-first-boot.md
+//
 // NOTE — ExpressRoute circuit lifecycle:
 //   The ER circuit itself is created MANUALLY by the network
 //   team via Azure Portal or CLI (see docs/expressroute-setup.md).
 //   This template deploys only the Azure-side infrastructure:
-//     • Hub VNet + subnets
-//     • Ingress VNet + subnets + VNet peering
+//     • Hub VNet + subnets + NSGs
+//     • Ingress VNet + subnets + NSGs + VNet peering
 //     • ExpressRoute Virtual Network Gateway (ErGw1AZ)
-//     • Checkpoint CloudGuard NVA (VMSS, dual NIC)
-//     • NSGs, Route Tables, Public IPs
+//     • Route Tables
 //     • DDoS Protection Plan (Standard)
 //   Once the circuit is manually created and the provider has
 //   provisioned it, run the separate workflow:
@@ -52,24 +69,6 @@ param ingressVnetAddressPrefix string = '10.1.0.0/16'
 @description('Log Analytics workspace resource ID for diagnostics')
 param logAnalyticsWorkspaceId string
 
-@description('Checkpoint admin username')
-param checkpointAdminUsername string = 'azureadmin'
-
-@secure()
-@description('Checkpoint admin password')
-param checkpointAdminPassword string
-
-@description('Checkpoint VM size')
-param checkpointVmSize string = 'Standard_D3_v2'
-
-@description('Checkpoint licence SKU: sg-byol | sg-ngtp | sg-ngtx')
-@allowed(['sg-byol', 'sg-ngtp', 'sg-ngtx'])
-param checkpointSku string = 'sg-byol'
-
-@description('Number of Checkpoint VMSS instances (DD30 minimum 2)')
-@minValue(2)
-param checkpointInstanceCount int = 2
-
 @description('ExpressRoute Gateway SKU. ErGw1AZ = zone-redundant 1 Gbps. Upgrade to ErGw2AZ for 10 Gbps.')
 @allowed(['ErGw1AZ', 'ErGw2AZ', 'ErGw3AZ'])
 param erGatewaySku string = 'ErGw1AZ'
@@ -85,42 +84,39 @@ param tags object = {
   createdBy  : 'alz-bicep'
 }
 
-@description('Apply CanNotDelete resource lock to the hub connectivity resource group. Prevents accidental deletion of the hub VNet, ER Gateway, and Checkpoint VMSS.')
+@description('Apply CanNotDelete resource lock to the hub connectivity resource group.')
 param enableResourceLocks bool = true
 
 @description('Deploy Private DNS zones for PaaS services. Required when workloads use private endpoints.')
 param deployPrivateDnsZones bool = true
 
-// ── Effective Tags — merges caller-supplied tags with mandatory platform tags ──
-// Mandatory tags are always applied regardless of what the caller passes.
-// This ensures compliance with the require-tags-on-rg policy (GOV-02).
+// ── Effective Tags ────────────────────────────────────────────────────────────
 var effectiveTags = union(tags, {
   managedBy : 'platform-team'
   createdBy : 'alz-bicep'
-  deployedAt: utcNow('yyyy-MM-dd')   // Deployment timestamp for audit trail
+  deployedAt: utcNow('yyyy-MM-dd')
 })
 
-// ── Derived Subnet CIDRs (from hubVnetAddressPrefix) ──────────────────
+// ── Derived Subnet CIDRs (from hubVnetAddressPrefix) ──────────────────────────
 // cidrSubnet(prefix, newbits, index) — all derived from /16 base:
-//   hubSubnetExternal : /16 + 12 bits = /28, block 0  → e.g. 10.0.0.0/28
 //   hubSubnetInternal : /16 + 12 bits = /28, block 16 → e.g. 10.0.1.0/28
 //   hubSubnetMgmt     : /16 +  8 bits = /24, block 2  → e.g. 10.0.2.0/24
 //   hubSubnetGateway  : /16 + 11 bits = /27, block 24 → e.g. 10.0.3.0/27
-var hubSubnetExternal  = cidrSubnet(hubVnetAddressPrefix, 12, 0)
 var hubSubnetInternal  = cidrSubnet(hubVnetAddressPrefix, 12, 16)
 var hubSubnetMgmt      = cidrSubnet(hubVnetAddressPrefix, 8,  2)
 var hubSubnetGateway   = cidrSubnet(hubVnetAddressPrefix, 11, 24)
 
-// ── Derived Subnet CIDRs (from ingressVnetAddressPrefix) ──────────────
+// ── Derived Subnet CIDRs (from ingressVnetAddressPrefix) ─────────────────────
 //   ingressSubnetExternal: /16 + 12 bits = /28, block 0 → e.g. 10.1.0.0/28
 //   ingressSubnetDmz     : /16 +  8 bits = /24, block 1 → e.g. 10.1.1.0/24
 var ingressSubnetExternal = cidrSubnet(ingressVnetAddressPrefix, 12, 0)
 var ingressSubnetDmz      = cidrSubnet(ingressVnetAddressPrefix, 8,  1)
 
-// ── Derived Static Host IPs ──────────────────────────────────────────
-// Azure reserves .0–.3 in every subnet; first usable host = index 4
+// ── Reserved NVA IP — published as output for manual Checkpoint deployment ───
+// Azure reserves .0–.3 in every subnet; first usable host = index 4.
+// The network team should assign this IP to the Checkpoint Internal LB
+// frontend when deploying the NVA manually.
 var checkpointInternalIp = cidrHost(hubSubnetInternal, 4)
-var checkpointExternalIp = cidrHost(hubSubnetExternal, 4)
 
 // ============================================================
 // Resource Group
@@ -151,21 +147,6 @@ resource ddosProtectionPlan 'Microsoft.Network/ddosProtectionPlans@2023-09-01' =
 // Public IPs
 // ============================================================
 
-// Checkpoint external NIC — public IP for internet egress via External LB
-module checkpointExternalPip 'br/public:avm/res/network/public-ip-address:0.7.1' = {
-  name: 'deploy-pip-checkpoint-external'
-  scope: rg
-  params: {
-    name                   : 'pip-checkpoint-external-001'
-    location               : location
-    skuName                : 'Standard'
-    publicIPAllocationMethod: 'Static'
-    zones                  : ['1', '2', '3']
-    tags                   : effectiveTags
-    diagnosticSettings     : [{ workspaceResourceId: logAnalyticsWorkspaceId }]
-  }
-}
-
 // ExpressRoute Gateway PIP — zone-redundant, required by ErGw*AZ SKUs
 module erGatewayPip 'br/public:avm/res/network/public-ip-address:0.7.1' = {
   name: 'deploy-pip-ergw'
@@ -185,8 +166,11 @@ module erGatewayPip 'br/public:avm/res/network/public-ip-address:0.7.1' = {
 // Network Security Groups
 // ============================================================
 
-// NSG for Checkpoint external subnet (now on ingress VNet - DD31)
-// FIX #30 — Added explicit Deny-All-Inbound rule (priority 4096)
+// NSG for Checkpoint external subnet (ingress VNet — DD31)
+// Permits internet HTTPS/HTTP inbound and on-prem Checkpoint management ports.
+// Deny-All-Inbound at priority 4096 ensures no implicit permit.
+// NOTE: Tighten or replace these rules once Checkpoint is deployed
+//       and the actual traffic profile is known.
 module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0.5.0' = {
   name: 'deploy-nsg-checkpoint-external'
   scope: rg
@@ -198,53 +182,53 @@ module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0
       {
         name: 'Allow-HTTPS-Inbound'
         properties: {
-          priority: 100
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          sourceAddressPrefix: '*'
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '443'
+          priority                 : 100
+          protocol                 : 'Tcp'
+          access                   : 'Allow'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : '*'
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '443'
         }
       }
       {
         name: 'Allow-HTTP-Inbound'
         properties: {
-          priority: 110
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          sourceAddressPrefix: '*'
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '80'
+          priority                 : 110
+          protocol                 : 'Tcp'
+          access                   : 'Allow'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : '*'
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '80'
         }
       }
       {
         name: 'Allow-CheckpointMgmt-Inbound'
         properties: {
-          priority: 120
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          sourceAddressPrefixes: [onPremAddressSpace]   // On-prem only
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRanges: ['18190', '19009', '257', '8211']
+          priority                 : 120
+          protocol                 : 'Tcp'
+          access                   : 'Allow'
+          direction                : 'Inbound'
+          sourceAddressPrefixes    : [onPremAddressSpace]   // On-prem only
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRanges    : ['18190', '19009', '257', '8211']
         }
       }
       {
         name: 'Deny-All-Inbound'
         properties: {
-          priority: 4096
-          protocol: '*'
-          access: 'Deny'
-          direction: 'Inbound'
-          sourceAddressPrefix: '*'
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '*'
+          priority                 : 4096
+          protocol                 : '*'
+          access                   : 'Deny'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : '*'
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '*'
         }
       }
     ]
@@ -252,7 +236,6 @@ module nsgCheckpointExternal 'br/public:avm/res/network/network-security-group:0
   }
 }
 
-// FIX #30 — Added explicit Deny-All-Inbound rule (priority 4096)
 module nsgCheckpointInternal 'br/public:avm/res/network/network-security-group:0.5.0' = {
   name: 'deploy-nsg-checkpoint-internal'
   scope: rg
@@ -264,14 +247,14 @@ module nsgCheckpointInternal 'br/public:avm/res/network/network-security-group:0
       {
         name: 'Deny-All-Inbound'
         properties: {
-          priority: 4096
-          protocol: '*'
-          access: 'Deny'
-          direction: 'Inbound'
-          sourceAddressPrefix: '*'
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '*'
+          priority                 : 4096
+          protocol                 : '*'
+          access                   : 'Deny'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : '*'
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '*'
         }
       }
     ]
@@ -279,7 +262,7 @@ module nsgCheckpointInternal 'br/public:avm/res/network/network-security-group:0
   }
 }
 
-// NSG for DMZ subnet in ingress VNet
+// NSG for DMZ subnet in ingress VNet — permissive placeholder; tighten post-deployment
 module nsgIngressDmz 'br/public:avm/res/network/network-security-group:0.5.0' = {
   name: 'deploy-nsg-ingress-dmz'
   scope: rg
@@ -292,9 +275,7 @@ module nsgIngressDmz 'br/public:avm/res/network/network-security-group:0.5.0' = 
   }
 }
 
-// FIX #8 — NSG for management subnet
-// Management jump hosts require RDP/SSH access from on-premises only.
-// All other inbound traffic is explicitly denied.
+// NSG for management subnet — RDP/SSH from on-premises only; all other inbound denied
 module nsgManagement 'br/public:avm/res/network/network-security-group:0.5.0' = {
   name: 'deploy-nsg-management'
   scope: rg
@@ -306,40 +287,40 @@ module nsgManagement 'br/public:avm/res/network/network-security-group:0.5.0' = 
       {
         name: 'Allow-RDP-from-OnPrem'
         properties: {
-          priority: 100
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          sourceAddressPrefix: onPremAddressSpace
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '3389'
+          priority                 : 100
+          protocol                 : 'Tcp'
+          access                   : 'Allow'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : onPremAddressSpace
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '3389'
         }
       }
       {
         name: 'Allow-SSH-from-OnPrem'
         properties: {
-          priority: 110
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Inbound'
-          sourceAddressPrefix: onPremAddressSpace
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '22'
+          priority                 : 110
+          protocol                 : 'Tcp'
+          access                   : 'Allow'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : onPremAddressSpace
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '22'
         }
       }
       {
         name: 'Deny-All-Inbound'
         properties: {
-          priority: 4096
-          protocol: '*'
-          access: 'Deny'
-          direction: 'Inbound'
-          sourceAddressPrefix: '*'
-          sourcePortRange: '*'
-          destinationAddressPrefix: '*'
-          destinationPortRange: '*'
+          priority                 : 4096
+          protocol                 : '*'
+          access                   : 'Deny'
+          direction                : 'Inbound'
+          sourceAddressPrefix      : '*'
+          sourcePortRange          : '*'
+          destinationAddressPrefix : '*'
+          destinationPortRange     : '*'
         }
       }
     ]
@@ -348,13 +329,15 @@ module nsgManagement 'br/public:avm/res/network/network-security-group:0.5.0' = 
 }
 
 // ============================================================
-// Route Table — force all spoke default traffic via Checkpoint
-// Next-hop = checkpointInternalIp (cidrHost(hubSubnetInternal, 4)) = Internal LB frontend IP (VMSS backend)
-// FIX #23 — Renamed from udr-to-checkpoint-001 to rt-to-checkpoint-hub-001
-//            (rt- prefix aligns with CAF naming convention for route tables)
+// Route Table — default route via Checkpoint NVA
+//
+// Next-hop IP = checkpointInternalIp (cidrHost of snet-checkpoint-internal, index 4).
+// This is a PLACEHOLDER until Checkpoint is manually deployed.
+// If the network team assigns a different Internal LB frontend IP,
+// update the nextHopIpAddress value and re-run this pipeline.
 // ============================================================
 module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
-  name: 'deploy-udr-to-checkpoint'
+  name: 'deploy-rt-to-checkpoint'
   scope: rg
   params: {
     name    : 'rt-to-checkpoint-hub-001'
@@ -366,7 +349,7 @@ module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
         properties: {
           addressPrefix   : '0.0.0.0/0'
           nextHopType     : 'VirtualAppliance'
-          nextHopIpAddress: checkpointInternalIp   // Internal LB frontend static IP (VMSS cluster)
+          nextHopIpAddress: checkpointInternalIp   // Reserved for manual Checkpoint Internal LB
         }
       }
     ]
@@ -376,9 +359,8 @@ module routeTableSpoke 'br/public:avm/res/network/route-table:0.4.0' = {
 // ============================================================
 // Hub Virtual Network — egress / hybrid (DD31)
 //
-// This VNet connects to on-premises via ExpressRoute.
-// The Checkpoint internal NIC (eth1) is here.
-// External NIC (eth0) has MOVED to vnet-ingress-australiaeast-001.
+// Hosts Checkpoint eth1 (internal NIC) and the ER Gateway.
+// Checkpoint VMs are deployed MANUALLY into snet-checkpoint-internal.
 // ============================================================
 module hubVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
   name: 'deploy-hub-vnet'
@@ -388,27 +370,25 @@ module hubVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
     location       : location
     addressPrefixes: [hubVnetAddressPrefix]
     tags           : effectiveTags
-    // DDoS Protection Standard (DD34)
     ddosProtectionPlanResourceId: ddosProtectionPlan.id
     subnets: [
       {
-        // Checkpoint eth1 — internal / trusted. All spoke traffic enters here.
-        // Static IP is assigned to the Internal LB frontend (cidrHost(hubSubnetInternal, 4)).
-        name                         : 'snet-checkpoint-internal'
-        addressPrefix                : hubSubnetInternal
+        // Checkpoint eth1 — internal / trusted.
+        // MANUAL: Deploy Checkpoint NVA into this subnet after pipeline completes.
+        // Reserved Internal LB IP: see output 'checkpointInternalIp'.
+        name                          : 'snet-checkpoint-internal'
+        addressPrefix                 : hubSubnetInternal
         networkSecurityGroupResourceId: nsgCheckpointInternal.outputs.resourceId
       }
       {
-        // Management jump hosts — reachable from on-prem via ER (no Bastion)
-        // FIX #7  — UDR removed: management traffic (Azure platform, diagnostics,
-        //           update services) must NOT be forced through Checkpoint NVA.
-        // FIX #8  — NSG attached: restricts inbound to RDP/SSH from on-prem only.
+        // Management jump hosts — reachable from on-prem via ER (no Bastion).
+        // UDR intentionally omitted: management traffic must not traverse the NVA.
         name                          : 'snet-management'
         addressPrefix                 : hubSubnetMgmt
         networkSecurityGroupResourceId: nsgManagement.outputs.resourceId
       }
       {
-        // Reserved for ExpressRoute Gateway — no NSG or UDR permitted
+        // Reserved for ExpressRoute Gateway — no NSG or UDR permitted by Azure.
         name         : 'GatewaySubnet'
         addressPrefix: hubSubnetGateway
       }
@@ -421,8 +401,8 @@ module hubVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
 // ============================================================
 // Ingress Virtual Network — internet-facing / DMZ (DD31)
 //
-// This VNet hosts internet-facing workloads and Checkpoint eth0.
-// Peered to hub VNet for traffic to flow through the NVA cluster.
+// Hosts Checkpoint eth0 (external NIC) and DMZ workloads.
+// Checkpoint VMs are deployed MANUALLY into snet-checkpoint-external.
 // ============================================================
 module ingressVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
   name: 'deploy-ingress-vnet'
@@ -432,54 +412,46 @@ module ingressVnet 'br/public:avm/res/network/virtual-network:0.5.2' = {
     location       : location
     addressPrefixes: [ingressVnetAddressPrefix]
     tags           : effectiveTags
-    // DDoS Protection Standard (DD34)
     ddosProtectionPlanResourceId: ddosProtectionPlan.id
     subnets: [
       {
-        // Checkpoint eth0 — external / internet-facing (moved from hub VNet - DD31)
-        name                         : 'snet-checkpoint-external'
-        addressPrefix                : ingressSubnetExternal
+        // Checkpoint eth0 — external / internet-facing.
+        // MANUAL: Deploy Checkpoint NVA into this subnet after pipeline completes.
+        name                          : 'snet-checkpoint-external'
+        addressPrefix                 : ingressSubnetExternal
         networkSecurityGroupResourceId: nsgCheckpointExternal.outputs.resourceId
       }
       {
-        // DMZ workloads — internet-facing applications behind Checkpoint
-        name                         : 'snet-ingress-dmz'
-        addressPrefix                : ingressSubnetDmz
+        // DMZ workloads — internet-facing applications behind Checkpoint.
+        // UDR forces egress through Checkpoint once the NVA is deployed.
+        name                          : 'snet-ingress-dmz'
+        addressPrefix                 : ingressSubnetDmz
         networkSecurityGroupResourceId: nsgIngressDmz.outputs.resourceId
-        routeTableResourceId         : routeTableSpoke.outputs.resourceId
+        routeTableResourceId          : routeTableSpoke.outputs.resourceId
       }
     ]
     diagnosticSettings: [{ workspaceResourceId: logAnalyticsWorkspaceId }]
-    // VNet peering: ingress → hub
-    // Allow forwarded traffic so Checkpoint can route between VNets.
-    // Hub side peering (hub → ingress) is defined on hubVnet below via
-    // a separate peering resource to allow gateway transit.
     peerings: [
       {
-        name                    : 'peer-ingress-to-hub'
-        remoteVirtualNetworkResourceId: hubVnet.outputs.resourceId
-        allowForwardedTraffic   : true
-        allowVirtualNetworkAccess: true
-        allowGatewayTransit     : false
-        useRemoteGateways       : true   // ingress VNet uses hub ER gateway
+        name                           : 'peer-ingress-to-hub'
+        remoteVirtualNetworkResourceId : hubVnet.outputs.resourceId
+        allowForwardedTraffic          : true
+        allowVirtualNetworkAccess      : true
+        allowGatewayTransit            : false
+        useRemoteGateways              : true   // ingress VNet uses hub ER gateway
       }
     ]
   }
   dependsOn: [ddosProtectionPlan, hubVnet]
 }
 
-// VNet peering: hub → ingress (must be a separate resource for gateway transit)
-// FIX #14 — dependsOn [hubVnet, ingressVnet] is explicit here. The remoteVirtualNetwork.id
-//            also references ingressVnet.outputs.resourceId, making the dependency implicit
-//            as well. Both are present for clarity and correctness.
+// VNet peering: hub → ingress (separate resource required for gateway transit)
 resource hubToIngressPeering 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2023-09-01' = {
   name: 'vnet-hub-australiaeast-001/peer-hub-to-ingress'
   scope: rg
   dependsOn: [hubVnet, ingressVnet]
   properties: {
-    remoteVirtualNetwork: {
-      id: ingressVnet.outputs.resourceId
-    }
+    remoteVirtualNetwork     : { id: ingressVnet.outputs.resourceId }
     allowVirtualNetworkAccess: true
     allowForwardedTraffic    : true
     allowGatewayTransit      : true    // hub VNet shares its ER gateway with ingress VNet
@@ -491,25 +463,18 @@ resource hubToIngressPeering 'Microsoft.Network/virtualNetworks/virtualNetworkPe
 // ExpressRoute Virtual Network Gateway (Zone-Redundant)
 //
 // DD23 — Active/Active BGP:
-//   The AVM module br/public:avm/res/network/virtual-network-gateway:0.5.0
-//   does not expose an 'activeActive' parameter directly.
-//   To enable Active/Active mode:
-//     1. Provision this gateway (Active/Standby by default)
-//     2. Add a second PIP (pip-ergw-hub-002)
-//     3. Enable via Portal: Gateway → Configuration → Active-active mode
-//        or via CLI: az network vnet-gateway update --name ergw-hub-australiaeast-001
-//                       --resource-group rg-connectivity-hub-australiaeast-001
-//                       --set activeActive=true
-//                       --public-ip-address pip-ergw-hub-001 pip-ergw-hub-002
-//   Active/Active requires TWO public IPs and two BGP peers on the
-//   on-premises CE router. Coordinate with network team before enabling.
-//
-// This gateway is deployed by IaC and waits for the manually-
-// created ER circuit to be linked via the separate
-// 03b-platform-er-connection workflow once the provider has
-// provisioned the circuit.
+//   The AVM module does not expose an 'activeActive' parameter.
+//   To enable Active/Active mode after deployment:
+//     1. Add a second PIP (pip-ergw-hub-002)
+//     2. Enable via CLI:
+//        az network vnet-gateway update \
+//          --name ergw-hub-australiaeast-001 \
+//          --resource-group rg-connectivity-hub-australiaeast-001 \
+//          --set activeActive=true \
+//          --public-ip-address pip-ergw-hub-001 pip-ergw-hub-002
+//   Coordinate with the network team — Active/Active requires two
+//   BGP peers on the on-premises CE router.
 // ============================================================
-// FIX #11 — diagnosticSettings verified present and updated to include explicit name
 module erGateway 'br/public:avm/res/network/virtual-network-gateway:0.5.0' = {
   name: 'deploy-er-gateway'
   scope: rg
@@ -531,80 +496,22 @@ module erGateway 'br/public:avm/res/network/virtual-network-gateway:0.5.0' = {
 }
 
 // ============================================================
-// Checkpoint CloudGuard NVA — VM Scale Set (DD30)
-//
-// External NIC (eth0) → vnet-ingress-australiaeast-001 / snet-checkpoint-external
-// Internal NIC (eth1) → vnet-hub-australiaeast-001    / snet-checkpoint-internal
-// ============================================================
-module checkpointVmss './modules/checkpoint-vmss.bicep' = {
-  name: 'deploy-checkpoint-vmss'
-  scope: rg
-  params: {
-    location               : location
-    vmssName               : 'vmss-checkpoint-hub-001'
-    vmSize                 : checkpointVmSize
-    adminUsername          : checkpointAdminUsername
-    adminPassword          : checkpointAdminPassword
-    checkpointSku          : checkpointSku
-    // eth0 — external NIC in ingress VNet (DD31: external moved to ingress VNet)
-    externalSubnetId       : '${ingressVnet.outputs.resourceId}/subnets/snet-checkpoint-external'
-    // eth1 — internal NIC in hub VNet
-    internalSubnetId       : '${hubVnet.outputs.resourceId}/subnets/snet-checkpoint-internal'
-    externalPublicIpId       : checkpointExternalPip.outputs.resourceId
-    logAnalyticsWorkspaceId  : logAnalyticsWorkspaceId
-    instanceCount            : checkpointInstanceCount
-    internalLbFrontendIp     : checkpointInternalIp
-    checkpointExternalStaticIp: checkpointExternalIp
-    tags                     : effectiveTags
-  }
-}
-
-// ============================================================
-// Outputs
-// ============================================================
-output hubVnetId              string = hubVnet.outputs.resourceId
-output hubVnetName            string = hubVnet.outputs.name
-output ingressVnetId          string = ingressVnet.outputs.resourceId
-output ingressVnetName        string = ingressVnet.outputs.name
-output checkpointInternalIp   string = checkpointInternalIp
-output erGatewayId            string = erGateway.outputs.resourceId
-output erGatewayName          string = 'ergw-hub-australiaeast-001'
-// FIX #23 — routeTableId now reflects the renamed rt-to-checkpoint-hub-001 resource
-output routeTableId           string = routeTableSpoke.outputs.resourceId
-output resourceGroupId        string = rg.id
-output ddosProtectionPlanId   string = ddosProtectionPlan.id
-// NOTE: erCircuitId is NOT output here — the circuit is created manually.
-// After manual creation, copy the circuit resource ID and use it in
-// the 03b-platform-er-connection workflow.
-
-// Subnet resource IDs — needed by downstream modules (security private endpoints, identity peering)
-output managementSubnetId     string = '${hubVnet.outputs.resourceId}/subnets/snet-management'
-output gatewaySubnetId        string = '${hubVnet.outputs.resourceId}/subnets/GatewaySubnet'
-output internalSubnetId       string = '${hubVnet.outputs.resourceId}/subnets/snet-checkpoint-internal'
-output ingressDmzSubnetId     string = '${ingressVnet.outputs.resourceId}/subnets/snet-ingress-dmz'
-output checkpointVmssId       string = checkpointVmss.outputs.vmssId
-output checkpointInternalLbId string = checkpointVmss.outputs.internalLbId
-output resourceGroupName      string = rg.name
-
-// ============================================================
 // Private DNS Zones — 28 zones for PaaS private endpoints
-// Linked to hub VNet so all spoke workloads resolve PaaS via
-// private endpoints instead of public endpoints
 // ============================================================
 module privateDns './modules/private-dns.bicep' = if (deployPrivateDnsZones) {
   name: 'deploy-private-dns-zones'
   scope: rg
   params: {
-    hubVnetId           : hubVnet.outputs.resourceId
-    location            : location
-    tags                : effectiveTags
+    hubVnetId: hubVnet.outputs.resourceId
+    location : location
+    tags     : effectiveTags
   }
 }
 
 // ============================================================
 // Resource Lock — Hub Connectivity (CanNotDelete)
-// Protects the hub VNet, ER Gateway, Checkpoint VMSS, and all
-// associated networking resources from accidental deletion.
+// Protects the hub VNet, ER Gateway, and networking resources
+// from accidental deletion.
 // ============================================================
 resource hubConnectivityLock 'Microsoft.Authorization/locks@2020-05-01' = if (enableResourceLocks) {
   name: 'lock-hub-connectivity-cannotdelete'
@@ -613,7 +520,35 @@ resource hubConnectivityLock 'Microsoft.Authorization/locks@2020-05-01' = if (en
     level: 'CanNotDelete'
     notes: 'Hub connectivity resources — deletion requires Platform Architecture Board approval. Raise an RFC before removing this lock.'
   }
-  dependsOn: [hubVnet, ingressVnet, erGateway, checkpointVmss]
+  dependsOn: [hubVnet, ingressVnet, erGateway]
 }
 
-output resourceLockId string = enableResourceLocks ? hubConnectivityLock.id : ''
+// ============================================================
+// Outputs
+// ============================================================
+output hubVnetId          string = hubVnet.outputs.resourceId
+output hubVnetName        string = hubVnet.outputs.name
+output ingressVnetId      string = ingressVnet.outputs.resourceId
+output ingressVnetName    string = ingressVnet.outputs.name
+output erGatewayId        string = erGateway.outputs.resourceId
+output erGatewayName      string = 'ergw-hub-australiaeast-001'
+output routeTableId       string = routeTableSpoke.outputs.resourceId
+output resourceGroupId    string = rg.id
+output ddosProtectionPlanId string = ddosProtectionPlan.id
+output resourceGroupName  string = rg.name
+output resourceLockId     string = enableResourceLocks ? hubConnectivityLock.id : ''
+
+// Subnet resource IDs — needed by downstream modules (security private endpoints, identity peering)
+output managementSubnetId    string = '${hubVnet.outputs.resourceId}/subnets/snet-management'
+output gatewaySubnetId       string = '${hubVnet.outputs.resourceId}/subnets/GatewaySubnet'
+output internalSubnetId      string = '${hubVnet.outputs.resourceId}/subnets/snet-checkpoint-internal'
+output externalSubnetId      string = '${ingressVnet.outputs.resourceId}/subnets/snet-checkpoint-external'
+output ingressDmzSubnetId    string = '${ingressVnet.outputs.resourceId}/subnets/snet-ingress-dmz'
+
+// Reserved NVA IP — network team should assign this to the Checkpoint Internal LB frontend
+// when deploying the NVA manually. Matches the UDR next-hop in rt-to-checkpoint-hub-001.
+output checkpointInternalIp  string = checkpointInternalIp
+
+// NOTE: erCircuitId is NOT output here — the circuit is created manually.
+// After manual creation, copy the circuit resource ID and use it in
+// the 03b-platform-er-connection workflow.

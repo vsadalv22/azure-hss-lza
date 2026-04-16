@@ -44,12 +44,12 @@ It is maintained by the **WA Health HSS Platform Engineering team** and is the a
 | Primary region | Australia East | Highest Azure service availability in Australia |
 | Secondary region | Perth Extended Zone (PEZ) | Low-latency secondary hub for WA government workloads |
 | WAN connectivity | ExpressRoute Direct with MACsec | Layer 2 encryption, no internet exposure, predictable latency |
-| Firewall / NVA | Checkpoint CloudGuard R81.10 VMSS | Existing enterprise Checkpoint investment; VMSS provides HA without Azure Load Balancer |
-| NVA cluster mode | Load Sharing Multicast (2 instances) | Active-active inspection with automatic failover |
+| Firewall / NVA | Checkpoint CloudGuard R81.10 | Existing enterprise Checkpoint investment; deployed manually by network team into pre-provisioned subnets |
+| NVA deployment | Manual (Azure Marketplace) | IaC provisions VNets, subnets, NSGs, and route tables; Checkpoint VMs are deployed manually post-pipeline |
 | Management access | On-premises jump hosts via ExpressRoute | No Bastion — reduces attack surface and cost |
 | SIEM | Microsoft Sentinel | Cloud-native SIEM/SOAR, native integration with Microsoft Defender XDR |
 | Subscription model | EA vending (lz-vending AVM) | Automated spoke provisioning with security and network guardrails |
-| CI/CD platform | Azure DevOps (DD03) | Mandated enterprise CI/CD platform; GitHub Actions retained for reference only |
+| CI/CD platform | Azure DevOps (DD03) | Mandated enterprise CI/CD platform; Checkpoint NVA deployment is manual (not automated) |
 | Auth (CI/CD) | OIDC Federated Credentials | No client secrets stored — workload identity federation |
 | Secrets management | Azure Key Vault Premium / HSM | CMK on Log Analytics, no plaintext secrets in code or pipelines |
 | Audit logs | Immutable storage (WORM) | Tamper-proof audit trail for APRA CPS 234 and ISM compliance |
@@ -86,8 +86,8 @@ Tenant Root Group
                           │               │
                           │  ┌──────────┐ │
                           │  │Checkpoint│ │   Checkpoint CloudGuard R81.10
-                          │  │  VMSS    │ │   2-instance VMSS cluster
-                          │  │(2 nodes) │ │   Load Sharing Multicast
+                          │  │   NVA    │ │   Manual deployment by network team
+                          │  │ (manual) │ │   into pre-provisioned subnets
                           │  └────┬─────┘ │
                           └───────┼───────┘
                                   │ VNet Peering
