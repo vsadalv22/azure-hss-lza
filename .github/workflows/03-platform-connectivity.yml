@@ -56,7 +56,7 @@ jobs:
     name: Bicep Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Lint connectivity Bicep files
         run: |
           az bicep build --file platform/connectivity/main.bicep
@@ -68,7 +68,7 @@ jobs:
     needs: lint
     environment: platform-production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -111,7 +111,7 @@ jobs:
       route-table-id: ${{ steps.deploy.outputs.routeTableId }}
       er-gateway-id:  ${{ steps.deploy.outputs.erGatewayId }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2

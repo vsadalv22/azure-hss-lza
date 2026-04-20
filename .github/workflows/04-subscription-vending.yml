@@ -75,7 +75,7 @@ jobs:
       param_files: ${{ steps.detect.outputs.param_files }}
       has_files:   ${{ steps.detect.outputs.has_files }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 2
 
@@ -101,7 +101,7 @@ jobs:
     needs: detect-files
     if: needs.detect-files.outputs.has_files == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Bicep CLI
         run: az bicep install
       - name: Lint subscription-vending module
@@ -118,7 +118,7 @@ jobs:
         param_file: ${{ fromJson(needs.detect-files.outputs.param_files) }}
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -181,7 +181,7 @@ jobs:
         param_file: ${{ fromJson(needs.detect-files.outputs.param_files) }}
       fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -315,7 +315,7 @@ jobs:
       subscription_id:  ${{ steps.vend.outputs.subscriptionId }}
       spoke_vnet_id:    ${{ steps.vend.outputs.spokeVnetId }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2

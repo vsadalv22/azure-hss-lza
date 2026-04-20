@@ -25,7 +25,7 @@ jobs:
     name: Bicep Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Bicep lint
         run: az bicep build --file platform/management-groups/main.bicep
 
@@ -35,7 +35,7 @@ jobs:
     needs: lint
     environment: platform-review   # Requires approval for what-if review
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -57,7 +57,7 @@ jobs:
     needs: what-if
     environment: platform-production   # Requires manual approval
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
