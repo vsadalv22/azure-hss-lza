@@ -96,7 +96,7 @@ jobs:
             2>&1 | tee whatif-output.txt
 
       - name: Upload What-If Output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: connectivity-whatif-${{ github.run_id }}
           path: whatif-output.txt
@@ -147,7 +147,7 @@ jobs:
           echo "erGatewayId=$ERGW_ID"     >> "$GITHUB_OUTPUT"
 
       - name: Upload deployment output
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: connectivity-output
           path: connectivity-output.json
