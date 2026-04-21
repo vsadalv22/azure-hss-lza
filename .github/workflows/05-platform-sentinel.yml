@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Azure Login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           tenant-id:       ${{ env.AZURE_TENANT_ID }}
           client-id:       ${{ env.AZURE_CLIENT_ID }}
@@ -61,7 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Azure Login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           tenant-id:       ${{ env.AZURE_TENANT_ID }}
           client-id:       ${{ env.AZURE_CLIENT_ID }}
